@@ -101,6 +101,10 @@ pub struct Runtime {
 
     /// Blocking pool handle, used to signal shutdown
     blocking_pool: BlockingPool,
+
+    /// Stall detection monitor thread handle (dropped to stop the monitor).
+    #[cfg(feature = "stall-detection")]
+    stall_monitor: Option<crate::runtime::stall_detection::StallMonitorHandle>,
 }
 
 /// The flavor of a `Runtime`.
@@ -136,7 +140,18 @@ impl Runtime {
             scheduler,
             handle,
             blocking_pool,
+            #[cfg(feature = "stall-detection")]
+            stall_monitor: None,
         }
+    }
+
+    /// Sets the stall monitor handle. Called by the builder after construction.
+    #[cfg(feature = "stall-detection")]
+    pub(super) fn set_stall_monitor(
+        &mut self,
+        monitor: crate::runtime::stall_detection::StallMonitorHandle,
+    ) {
+        self.stall_monitor = Some(monitor);
     }
 
     /// Creates a new runtime instance with default configuration values.

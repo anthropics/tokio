@@ -137,6 +137,11 @@ pub struct Builder {
     pub(super) unhandled_panic: UnhandledPanic,
 
     timer_flavor: TimerFlavor,
+
+    /// Configuration for the stall detection monitor thread.
+    #[cfg(feature = "stall-detection")]
+    pub(super) stall_detection_config:
+        Option<crate::runtime::stall_detection::StallDetectionConfig>,
 }
 
 cfg_unstable! {
@@ -326,6 +331,9 @@ impl Builder {
             disable_lifo_slot: false,
 
             timer_flavor: TimerFlavor::Traditional,
+
+            #[cfg(feature = "stall-detection")]
+            stall_detection_config: None,
         }
     }
 
@@ -368,6 +376,154 @@ impl Builder {
         #[cfg(feature = "time")]
         self.enable_time();
 
+        self
+    }
+
+    /// Enable stall detection with default configuration (100ms poll interval,
+    /// 10s escalation threshold).
+    ///
+    /// When enabled, a background thread periodically checks whether any worker
+    /// thread is stalled (stuck in a long-running synchronous operation during
+    /// `Future::poll`). On Linux, the monitor captures a stack trace from the
+    /// stalled worker via a realtime signal (SIGRTMIN+1).
+    ///
+    /// Stall events are reported via `tracing` (at WARN level for resolved stalls,
+    /// ERROR level for escalations). A resolved stall logs the duration and the
+    /// stack trace captured at the time of detection. If a stall persists beyond the
+    /// escalation threshold (default 10 seconds), an intermediate warning is emitted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// use tokio::runtime;
+    ///
+    /// let rt = runtime::Builder::new_multi_thread()
+    ///     .enable_stall_detection()
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(feature = "stall-detection")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+    pub fn enable_stall_detection(&mut self) -> &mut Self {
+        self.stall_detection_config =
+            Some(crate::runtime::stall_detection::StallDetectionConfig::default());
+        self
+    }
+
+    /// Enable stall detection with a custom poll interval.
+    ///
+    /// The poll interval controls how frequently the monitor checks for stalled
+    /// workers. Default: 100ms.
+    ///
+    /// If stall detection has not been explicitly enabled, calling this method
+    /// will enable it with default values before applying the custom interval.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// use tokio::runtime;
+    /// use std::time::Duration;
+    ///
+    /// let rt = runtime::Builder::new_multi_thread()
+    ///     .stall_detection_poll_interval(Duration::from_millis(50))
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(feature = "stall-detection")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+    pub fn stall_detection_poll_interval(&mut self, interval: std::time::Duration) -> &mut Self {
+        self.stall_detection_config
+            .get_or_insert_with(crate::runtime::stall_detection::StallDetectionConfig::default)
+            .poll_interval = interval;
+        self
+    }
+
+    /// Set the escalation threshold for stall detection.
+    ///
+    /// If a stall persists longer than this, an intermediate warning is emitted
+    /// via `tracing` at ERROR level. Default: 10s.
+    ///
+    /// If stall detection has not been explicitly enabled, calling this method
+    /// will enable it with default values before applying the custom threshold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// use tokio::runtime;
+    /// use std::time::Duration;
+    ///
+    /// let rt = runtime::Builder::new_multi_thread()
+    ///     .enable_stall_detection()
+    ///     .stall_detection_escalation_threshold(Duration::from_secs(30))
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(feature = "stall-detection")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+    pub fn stall_detection_escalation_threshold(
+        &mut self,
+        threshold: std::time::Duration,
+    ) -> &mut Self {
+        self.stall_detection_config
+            .get_or_insert_with(crate::runtime::stall_detection::StallDetectionConfig::default)
+            .escalation_threshold = threshold;
+        self
+    }
+
+    /// Set a callback to be invoked when a scheduler stall is detected or resolved.
+    ///
+    /// The callback receives a [`StallInfo`] with the worker index, duration, stack trace,
+    /// and whether the stall has resolved.
+    ///
+    /// Stall events are always reported via `tracing` regardless of whether a
+    /// callback is set.
+    ///
+    /// If stall detection has not been explicitly enabled, calling this method
+    /// will enable it with default values before applying the callback.
+    ///
+    /// [`StallInfo`]: crate::runtime::StallInfo
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// use tokio::runtime;
+    ///
+    /// let rt = runtime::Builder::new_multi_thread()
+    ///     .on_stall(|info| {
+    ///         if info.resolved {
+    ///             println!("Worker {} stall resolved after {:?}", info.worker, info.duration);
+    ///         } else {
+    ///             println!("Worker {} stalled for {:?}", info.worker, info.duration);
+    ///         }
+    ///     })
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(feature = "stall-detection")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+    pub fn on_stall<F>(&mut self, callback: F) -> &mut Self
+    where
+        F: Fn(crate::runtime::stall_detection::StallInfo) + Send + Sync + 'static,
+    {
+        self.stall_detection_config
+            .get_or_insert_with(crate::runtime::stall_detection::StallDetectionConfig::default)
+            .on_stall = Some(std::sync::Arc::new(callback));
         self
     }
 
@@ -1558,11 +1714,18 @@ impl Builder {
         let (scheduler, handle, blocking_pool) =
             self.build_current_thread_runtime_components(None)?;
 
-        Ok(Runtime::from_parts(
-            Scheduler::CurrentThread(scheduler),
-            handle,
-            blocking_pool,
-        ))
+        #[allow(unused_mut)]
+        let mut rt =
+            Runtime::from_parts(Scheduler::CurrentThread(scheduler), handle, blocking_pool);
+
+        #[cfg(feature = "stall-detection")]
+        if let Some(config) = self.stall_detection_config.take() {
+            let monitor =
+                crate::runtime::stall_detection::start_monitor(rt.handle().clone(), config);
+            rt.set_stall_monitor(monitor);
+        }
+
+        Ok(rt)
     }
 
     #[cfg(tokio_unstable)]
@@ -1816,7 +1979,19 @@ cfg_rt_multi_thread! {
             let _enter = handle.enter();
             launch.launch();
 
-            Ok(Runtime::from_parts(Scheduler::MultiThread(scheduler), handle, blocking_pool))
+            #[allow(unused_mut)]
+            let mut rt = Runtime::from_parts(Scheduler::MultiThread(scheduler), handle, blocking_pool);
+
+            #[cfg(feature = "stall-detection")]
+            if let Some(config) = self.stall_detection_config.take() {
+                let monitor = crate::runtime::stall_detection::start_monitor(
+                    rt.handle().clone(),
+                    config,
+                );
+                rt.set_stall_monitor(monitor);
+            }
+
+            Ok(rt)
         }
     }
 }

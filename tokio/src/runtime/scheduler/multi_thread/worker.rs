@@ -148,6 +148,10 @@ struct Core {
     /// Per-worker runtime stats
     stats: Stats,
 
+    /// Generation counter for stall detection
+    #[cfg(feature = "stall-detection")]
+    local_generation: u64,
+
     /// How often to check the global queue
     global_queue_interval: u32,
 
@@ -287,6 +291,8 @@ pub(super) fn create(
             is_shutdown: false,
             is_traced: false,
             park: Some(park),
+            #[cfg(feature = "stall-detection")]
+            local_generation: 0,
             global_queue_interval: stats.tuned_global_queue_interval(&config),
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
@@ -362,6 +368,19 @@ where
                         if core.is_some() {
                             cx.worker.handle.shared.worker_metrics[cx.worker.index]
                                 .set_thread_id(thread::current().id());
+
+                            #[cfg(feature = "stall-detection")]
+                            {
+                                #[cfg(target_os = "linux")]
+                                // SAFETY: gettid() is always safe to call.
+                                let tid = unsafe { libc::gettid() } as u64;
+                                #[cfg(not(target_os = "linux"))]
+                                let tid = 0u64;
+
+                                cx.worker.handle.shared.worker_metrics[cx.worker.index]
+                                    .os_thread_id
+                                    .store(tid, std::sync::atomic::Ordering::Release);
+                            }
                         }
 
                         let mut cx_core = cx.core.borrow_mut();
@@ -514,6 +533,19 @@ fn run(worker: Arc<Worker>) {
 
     worker.handle.shared.worker_metrics[worker.index].set_thread_id(thread::current().id());
 
+    #[cfg(feature = "stall-detection")]
+    {
+        #[cfg(target_os = "linux")]
+        // SAFETY: gettid() is always safe to call.
+        let tid = unsafe { libc::gettid() } as u64;
+        #[cfg(not(target_os = "linux"))]
+        let tid = 0u64;
+
+        worker.handle.shared.worker_metrics[worker.index]
+            .os_thread_id
+            .store(tid, std::sync::atomic::Ordering::Release);
+    }
+
     let handle = scheduler::Handle::MultiThread(worker.handle.clone());
 
     crate::runtime::context::enter_runtime(&handle, true, |_| {
@@ -544,6 +576,16 @@ impl Context {
         // Reset `lifo_enabled` here in case the core was previously stolen from
         // a task that had the LIFO slot disabled.
         self.reset_lifo_enabled(&mut core);
+
+        // Ensure local_generation is even (= idle) when entering the run loop.
+        // This matters after block_in_place() hands off a Core mid-poll with an odd generation.
+        #[cfg(feature = "stall-detection")]
+        if core.local_generation % 2 == 1 {
+            core.local_generation += 1;
+            self.worker.handle.shared.worker_metrics[self.worker.index]
+                .poll_generation
+                .store(core.local_generation, std::sync::atomic::Ordering::Release);
+        }
 
         // Start as "processing" tasks as polling tasks from the local queue
         // will be one of the first things we do.
@@ -627,6 +669,15 @@ impl Context {
         // purposes. These tasks inherent the "parent"'s limits.
         core.stats.start_poll();
 
+        // Stall detection: mark poll start (odd generation)
+        #[cfg(feature = "stall-detection")]
+        {
+            core.local_generation += 1; // now odd = polling
+            self.worker.handle.shared.worker_metrics[self.worker.index]
+                .poll_generation
+                .store(core.local_generation, std::sync::atomic::Ordering::Release);
+        }
+
         // Make the core available to the runtime context
         *self.core.borrow_mut() = Some(core);
 
@@ -667,12 +718,28 @@ impl Context {
                     Some(task) => task,
                     None => {
                         self.reset_lifo_enabled(&mut core);
+                        // Stall detection: mark poll end (even generation)
+                        #[cfg(feature = "stall-detection")]
+                        {
+                            core.local_generation += 1; // now even = idle
+                            self.worker.handle.shared.worker_metrics[self.worker.index]
+                                .poll_generation
+                                .store(core.local_generation, std::sync::atomic::Ordering::Release);
+                        }
                         core.stats.end_poll();
                         return Ok(core);
                     }
                 };
 
                 if !coop::has_budget_remaining() {
+                    // Stall detection: mark poll end (even generation)
+                    #[cfg(feature = "stall-detection")]
+                    {
+                        core.local_generation += 1; // now even = idle
+                        self.worker.handle.shared.worker_metrics[self.worker.index]
+                            .poll_generation
+                            .store(core.local_generation, std::sync::atomic::Ordering::Release);
+                    }
                     core.stats.end_poll();
 
                     // Not enough budget left to run the LIFO task, push it to
@@ -702,6 +769,19 @@ impl Context {
                 if lifo_polls >= MAX_LIFO_POLLS_PER_TICK {
                     core.lifo_enabled = false;
                     super::counters::inc_lifo_capped();
+                }
+
+                // Stall detection: end previous poll (even) then start new poll (odd)
+                #[cfg(feature = "stall-detection")]
+                {
+                    core.local_generation += 1; // now even = idle
+                    self.worker.handle.shared.worker_metrics[self.worker.index]
+                        .poll_generation
+                        .store(core.local_generation, std::sync::atomic::Ordering::Release);
+                    core.local_generation += 1; // now odd = polling
+                    self.worker.handle.shared.worker_metrics[self.worker.index]
+                        .poll_generation
+                        .store(core.local_generation, std::sync::atomic::Ordering::Release);
                 }
 
                 // Run the LIFO task, then loop

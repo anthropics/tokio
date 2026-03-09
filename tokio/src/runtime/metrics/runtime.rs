@@ -101,6 +101,53 @@ impl RuntimeMetrics {
         self.handle.inner.injection_queue_depth()
     }
 
+    cfg_stall_detection! {
+        /// Returns the current poll generation counter for the given worker.
+        ///
+        /// Odd values indicate the worker is currently polling a task.
+        /// Even values indicate the worker is idle (between polls).
+        /// If two successive reads return the same odd value, the worker is likely stalled.
+        ///
+        /// # Arguments
+        ///
+        /// `worker` is the index of the worker being queried. The given value must
+        /// be between 0 and `num_workers()`.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()`.
+        pub fn worker_poll_generation(&self, worker: usize) -> u64 {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .poll_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Returns the OS thread ID of the thread currently running the given worker.
+        ///
+        /// On Linux, this is the value from `gettid()`. Returns 0 if not available
+        /// or on non-Linux platforms.
+        ///
+        /// # Arguments
+        ///
+        /// `worker` is the index of the worker being queried. The given value must
+        /// be between 0 and `num_workers()`.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()`.
+        pub fn worker_os_thread_id(&self, worker: usize) -> u64 {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .os_thread_id
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
     cfg_64bit_metrics! {
         /// Returns the amount of time the given worker thread has been busy.
         ///
