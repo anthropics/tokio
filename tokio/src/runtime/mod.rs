@@ -416,6 +416,12 @@ cfg_process_driver! {
     mod process;
 }
 
+#[cfg(feature = "stall-detection")]
+pub(crate) mod stall_detection;
+#[cfg(feature = "stall-detection")]
+#[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+pub use self::stall_detection::StallInfo;
+
 #[cfg_attr(not(feature = "time"), allow(dead_code))]
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum TimerFlavor {

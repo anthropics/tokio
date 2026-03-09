@@ -732,6 +732,16 @@ macro_rules! cfg_metrics_variant {
     }
 }
 
+macro_rules! cfg_stall_detection {
+    ($($item:item)*) => {
+        $(
+            #[cfg(feature = "stall-detection")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+            $item
+        )*
+    }
+}
+
 macro_rules! cfg_io_uring {
     ($($item:item)*) => {
         $(

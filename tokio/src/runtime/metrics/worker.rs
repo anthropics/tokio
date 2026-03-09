@@ -65,6 +65,14 @@ pub(crate) struct WorkerMetrics {
     #[cfg(tokio_unstable)]
     /// If `Some`, tracks the number of polls by duration range.
     pub(super) poll_count_histogram: Option<Histogram>,
+
+    /// Generation counter for stall detection. Odd = polling, even = idle.
+    #[cfg(feature = "stall-detection")]
+    pub(crate) poll_generation: std::sync::atomic::AtomicU64,
+
+    /// OS thread ID of the worker thread (e.g. from gettid() on Linux). 0 = unset.
+    #[cfg(feature = "stall-detection")]
+    pub(crate) os_thread_id: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerMetrics {

@@ -73,6 +73,10 @@ struct Core {
     /// Metrics batch
     metrics: MetricsBatch,
 
+    /// Generation counter for stall detection
+    #[cfg(feature = "stall-detection")]
+    local_generation: u64,
+
     /// How often to check the global queue
     global_queue_interval: u32,
 
@@ -174,6 +178,8 @@ impl CurrentThread {
             tick: 0,
             driver: Some(driver),
             metrics: MetricsBatch::new(&handle.shared.worker_metrics),
+            #[cfg(feature = "stall-detection")]
+            local_generation: 0,
             global_queue_interval,
             unhandled_panic: false,
         })));
@@ -202,6 +208,20 @@ impl CurrentThread {
                         .shared
                         .worker_metrics
                         .set_thread_id(thread::current().id());
+                    #[cfg(feature = "stall-detection")]
+                    {
+                        #[cfg(target_os = "linux")]
+                        // SAFETY: gettid() is always safe to call.
+                        let tid = unsafe { libc::gettid() } as u64;
+                        #[cfg(not(target_os = "linux"))]
+                        let tid = 0u64;
+
+                        handle
+                            .shared
+                            .worker_metrics
+                            .os_thread_id
+                            .store(tid, std::sync::atomic::Ordering::Release);
+                    }
                     return core.block_on(future);
                 } else {
                     let notified = self.notify.notified();
@@ -370,7 +390,27 @@ impl Context {
     /// thread-local context.
     fn run_task<R>(&self, mut core: Box<Core>, f: impl FnOnce() -> R) -> (Box<Core>, R) {
         core.metrics.start_poll();
+        // Stall detection: mark poll start (odd generation)
+        #[cfg(feature = "stall-detection")]
+        {
+            core.local_generation += 1; // now odd = polling
+            self.handle
+                .shared
+                .worker_metrics
+                .poll_generation
+                .store(core.local_generation, std::sync::atomic::Ordering::Release);
+        }
         let mut ret = self.enter(core, || crate::task::coop::budget(f));
+        // Stall detection: mark poll end (even generation)
+        #[cfg(feature = "stall-detection")]
+        {
+            ret.0.local_generation += 1; // now even = idle
+            self.handle
+                .shared
+                .worker_metrics
+                .poll_generation
+                .store(ret.0.local_generation, std::sync::atomic::Ordering::Release);
+        }
         ret.0.metrics.end_poll();
         ret
     }
