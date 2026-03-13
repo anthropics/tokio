@@ -1,3 +1,8 @@
+# Security notes:
+# - GitHub-owned actions (actions/checkout) use tag pins
+# - Third-party actions (jfrog/setup-jfrog-cli) are pinned to full commit SHAs
+# - Rust toolchain comes from the runner's pre-installed rustup
+# - The publish environment requires the anthropic-1.49.0 branch
 name: Publish to Artifactory
 
 on:
@@ -12,12 +17,14 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: publish-cli
+    environment: publish
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustup default stable
+          rustup show
 
       - name: Setup JFrog CLI
         uses: jfrog/setup-jfrog-cli@ff5cb544114ffc152db9cea1cd3d5978d5074946  # v4.5.11
@@ -27,18 +34,18 @@ jobs:
           oidc-provider-name: github
           oidc-audience: jfrog-github
 
-      - name: Configure Cargo Registry
+      - name: Configure Cargo
         run: |
+          ARTIFACTORY_TOKEN=$(jf config show | grep "Access Token" | awk '{print $3}')
           mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'EOF'
+          cat >> ~/.cargo/config.toml << EOF
           [registries.crates-internal]
           index = "sparse+https://artifactory.infra.ant.dev/artifactory/api/cargo/crates-internal/index/"
           credential-provider = ["cargo:token"]
           EOF
-
-      - name: Login to Cargo Registry
-        run: |
-          ARTIFACTORY_TOKEN=$(jf config show | grep "Access Token" | awk '{print $3}')
+          # TODO: Consider adding crates-io source replacement through Artifactory proxy
+          # once OIDC token read access to the crates-io proxy is confirmed.
+          # For now, cargo resolves dependencies from public crates.io directly.
           cargo login --registry crates-internal <<< "Bearer ${ARTIFACTORY_TOKEN}"
 
       - name: Publish tokio to Artifactory
