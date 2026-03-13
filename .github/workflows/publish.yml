@@ -1,0 +1,47 @@
+name: Publish to Artifactory
+
+on:
+  push:
+    branches:
+      - anthropic-1.49.0
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: publish-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@ff5cb544114ffc152db9cea1cd3d5978d5074946  # v4.5.11
+        env:
+          JF_URL: https://artifactory.infra.ant.dev
+        with:
+          oidc-provider-name: github
+          oidc-audience: jfrog-github
+
+      - name: Configure Cargo Registry
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'EOF'
+          [registries.crates-internal]
+          index = "sparse+https://artifactory.infra.ant.dev/artifactory/api/cargo/crates-internal/index/"
+          credential-provider = ["cargo:token"]
+          EOF
+
+      - name: Login to Cargo Registry
+        run: |
+          ARTIFACTORY_TOKEN=$(jf config show | grep "Access Token" | awk '{print $3}')
+          cargo login --registry crates-internal <<< "Bearer ${ARTIFACTORY_TOKEN}"
+
+      - name: Publish tokio to Artifactory
+        run: |
+          cd tokio
+          cargo publish --registry crates-internal --allow-dirty
