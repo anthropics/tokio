@@ -37,18 +37,80 @@ jobs:
       - name: Configure Cargo
         run: |
           ARTIFACTORY_TOKEN=$(jf config show | grep "Access Token" | awk '{print $3}')
+          
+          # Store token for later steps
+          echo "ARTIFACTORY_TOKEN=${ARTIFACTORY_TOKEN}" >> $GITHUB_ENV
+          
+          # Configure registry (no credential-provider -- we'll handle auth explicitly)
           mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << EOF
+          cat >> ~/.cargo/config.toml << 'EOF'
           [registries.crates-internal]
           index = "sparse+https://artifactory.infra.ant.dev/artifactory/api/cargo/crates-internal/index/"
-          credential-provider = ["cargo:token"]
           EOF
-          # TODO: Consider adding crates-io source replacement through Artifactory proxy
-          # once OIDC token read access to the crates-io proxy is confirmed.
-          # For now, cargo resolves dependencies from public crates.io directly.
-          cargo login --registry crates-internal <<< "Bearer ${ARTIFACTORY_TOKEN}"
+
+      - name: Debug - Verify Artifactory Access
+        run: |
+          echo "=== JFrog CLI Config ==="
+          jf config show | grep -v "Token" || true
+
+          echo ""
+          echo "=== Token format check ==="
+          # Show first 20 chars of token (safe to log partial token for format debugging)
+          TOKEN_PREFIX=$(echo "Bearer ${ARTIFACTORY_TOKEN}" | head -c 20)
+          echo "Token starts with: ${TOKEN_PREFIX}..."
+          echo "Token length: ${#ARTIFACTORY_TOKEN} (without Bearer prefix)"
+
+          echo ""
+          echo "=== Cargo config ==="
+          cat ~/.cargo/config.toml || true
+
+          echo ""
+          echo "=== Cargo credentials ==="
+          cat ~/.cargo/credentials.toml 2>/dev/null || echo "(no credentials.toml)"
+
+          echo ""
+          echo "=== Test: curl sparse index for tokio (with auth, should succeed) ==="
+          curl -sv -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
+            "https://artifactory.infra.ant.dev/artifactory/api/cargo/crates-internal/index/to/ki/tokio" \
+            2>&1 | grep -E "< HTTP|< WWW-Auth|Authorization:|{" || true
+
+          echo ""
+          echo "=== Test: curl sparse index for tokio (no auth, expect 401) ==="
+          curl -sv \
+            "https://artifactory.infra.ant.dev/artifactory/api/cargo/crates-internal/index/to/ki/tokio" \
+            2>&1 | grep -E "< HTTP|< WWW-Auth|{" || true
+
+          echo ""
+          echo "=== Test: JFrog CLI check permissions ==="
+          jf rt curl -XGET "/api/cargo/crates-internal/index/to/ki/tokio" 2>&1 | head -10 || true
+
+          echo ""
+          echo "=== Cargo registry list ==="
+          cargo config get registries 2>/dev/null || true
+
+          echo ""
+          echo "=== ARTIFACTORY_TOKEN env var (redacted) ==="
+          echo "ARTIFACTORY_TOKEN is set: $([ -n \"${ARTIFACTORY_TOKEN}\" ] && echo yes || echo no)"
 
       - name: Publish tokio to Artifactory
         run: |
           cd tokio
-          cargo publish --registry crates-internal --allow-dirty
+          
+          echo "=== Attempt 1: env var auth ==="
+          export CARGO_REGISTRIES_CRATES_INTERNAL_TOKEN="Bearer ${ARTIFACTORY_TOKEN}"
+          if cargo publish --registry crates-internal --allow-dirty 2>&1; then
+            echo "SUCCESS: env var auth worked"
+            exit 0
+          fi
+          echo "FAILED: env var auth did not work"
+          unset CARGO_REGISTRIES_CRATES_INTERNAL_TOKEN
+          
+          echo ""
+          echo "=== Attempt 2: cargo login auth ==="
+          cargo login --registry crates-internal <<< "Bearer ${ARTIFACTORY_TOKEN}"
+          if cargo publish --registry crates-internal --allow-dirty 2>&1; then
+            echo "SUCCESS: cargo login auth worked"
+            exit 0
+          fi
+          echo "FAILED: cargo login auth did not work either"
+          exit 1
