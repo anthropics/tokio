@@ -337,6 +337,16 @@ impl Core {
     }
 
     fn next_task(&mut self, handle: &Handle) -> Option<Notified> {
+        if handle.shared.config.deterministic_external_spawn {
+            // Absorb all inject items into the local FIFO before popping. With
+            // a coordinated external thread that only pushes while this
+            // executor is blocked, this makes the resulting schedule fully
+            // deterministic regardless of `global_queue_interval`.
+            while let Some(task) = handle.next_remote_task() {
+                self.tasks.push_back(task);
+            }
+            return self.next_local_task(handle);
+        }
         if self.tick % self.global_queue_interval == 0 {
             handle
                 .next_remote_task()

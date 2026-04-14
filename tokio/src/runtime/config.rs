@@ -45,6 +45,13 @@ pub(crate) struct Config {
     /// deterministic way.
     pub(crate) seed_generator: RngSeedGenerator,
 
+    /// When true, the `current_thread` scheduler drains the inject queue
+    /// into the local queue before each task pop, so external spawns/wakes
+    /// are observed at a deterministic point relative to local processing.
+    /// Intended for deterministic-simulation testing where a coordinated
+    /// worker thread spawns onto this runtime.
+    pub(crate) deterministic_external_spawn: bool,
+
     /// How to build poll time histograms
     pub(crate) metrics_poll_count_histogram: Option<crate::runtime::HistogramBuilder>,
 

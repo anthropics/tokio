@@ -127,6 +127,9 @@ pub struct Builder {
     /// Specify a random number generator seed to provide deterministic results
     pub(super) seed_generator: RngSeedGenerator,
 
+    /// See [`deterministic_external_spawn`](Builder::deterministic_external_spawn).
+    pub(super) deterministic_external_spawn: bool,
+
     /// When true, enables task poll count histogram instrumentation.
     pub(super) metrics_poll_count_histogram_enable: bool,
 
@@ -329,6 +332,8 @@ impl Builder {
             metrics_poll_count_histogram: HistogramBuilder::default(),
 
             disable_lifo_slot: false,
+
+            deterministic_external_spawn: false,
 
             timer_flavor: TimerFlavor::Traditional,
 
@@ -1262,6 +1267,21 @@ impl Builder {
         self
     }
 
+    /// (`current_thread` only) Drains the inject queue into the local queue
+    /// before each task pop, so spawns and wakes from non-runtime threads
+    /// are observed at a deterministic point relative to local processing.
+    ///
+    /// Intended for deterministic-simulation testing where a coordinated
+    /// worker thread spawns onto this runtime while the executor is blocked.
+    /// In that setup the inject items are pushed in FIFO order with no
+    /// concurrent pop, so draining at a fixed point makes the resulting
+    /// schedule fully deterministic. Has no effect on the multi-threaded
+    /// scheduler.
+    pub fn deterministic_external_spawn(&mut self, val: bool) -> &mut Self {
+        self.deterministic_external_spawn = val;
+        self
+    }
+
     /// Sets the number of scheduler ticks after which the scheduler will poll for
     /// external events (timers, I/O, and so on).
     ///
@@ -1786,6 +1806,7 @@ impl Builder {
                 #[cfg(tokio_unstable)]
                 unhandled_panic: self.unhandled_panic.clone(),
                 disable_lifo_slot: self.disable_lifo_slot,
+                deterministic_external_spawn: self.deterministic_external_spawn,
                 seed_generator: seed_generator_1,
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
             },
@@ -1967,6 +1988,7 @@ cfg_rt_multi_thread! {
                     #[cfg(tokio_unstable)]
                     unhandled_panic: self.unhandled_panic.clone(),
                     disable_lifo_slot: self.disable_lifo_slot,
+                    deterministic_external_spawn: self.deterministic_external_spawn,
                     seed_generator: seed_generator_1,
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
                 },
