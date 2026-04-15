@@ -550,9 +550,9 @@ cfg_rt! {
 
     mod builder;
     pub use self::builder::Builder;
+    pub use crate::util::rand::RngSeed;
     cfg_unstable! {
         pub use self::builder::UnhandledPanic;
-        pub use crate::util::rand::RngSeed;
 
         mod local_runtime;
         pub use local_runtime::{LocalRuntime, LocalOptions};
