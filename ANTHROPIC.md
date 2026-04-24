@@ -4,8 +4,11 @@ This is Anthropic's fork of [tokio](https://github.com/tokio-rs/tokio), publishe
 
 ## Version Convention
 
-Versions follow the `+anthropic.N` suffix convention per `go/fork`:
-- `1.49.0+anthropic.1` = tokio 1.49.0 + stall detection feature
+Versions use the upstream major.minor with a fork-owned patch number `P = N * 1000 + upstream_patch`, plus a constant `+anthropic` build-metadata tag:
+
+- `1.49.1000+anthropic` = first fork release based on tokio 1.49.0
+- `1.49.2000+anthropic` = second fork release
+- `1.49.3001+anthropic` = third fork release, after rebasing onto tokio 1.49.1
 
 ## Features Added
 
@@ -38,5 +41,5 @@ In the workspace `Cargo.toml`:
 
 ```toml
 [patch.crates-io]
-tokio = { version = "1.49.0+anthropic.1", registry = "crates-internal" }
+tokio = { version = "1.49.1000+anthropic", registry = "crates-internal" }
 ```
