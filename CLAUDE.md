@@ -2,30 +2,29 @@
 
 ## Version Bumping
 
-Every PR merged to an `anthropic-*` branch MUST bump the `+anthropic.N` version suffix.
-Increment `N` by 1 from whatever the current value is.
+Every PR merged to an `anthropic-*` branch MUST bump the patch version in `tokio/Cargo.toml`.
 
 ### Files to update
 
-All publishable crates need matching version suffixes:
-
 - `tokio/Cargo.toml` - main tokio crate
-- `tokio-macros/Cargo.toml` - proc macros
-- `tokio-stream/Cargo.toml` - stream utilities
-- `tokio-test/Cargo.toml` - test utilities
-- `tokio-util/Cargo.toml` - additional utilities
 
-Example: if current versions end in `+anthropic.3`, update them all to `+anthropic.4`.
+The other workspace crates (`tokio-macros`, `tokio-stream`, `tokio-test`, `tokio-util`) are not published from this fork; the published `tokio` crate depends on them via crates.io.
 
 ### Version format
 
-`<upstream_version>+anthropic.<N>`
+`<upstream_major>.<upstream_minor>.<P>+anthropic` where `P = N * 1000 + upstream_patch`
 
-Examples:
-- `1.49.0+anthropic.1` (first anthropic release based on tokio 1.49.0)
-- `1.49.0+anthropic.2` (second anthropic release)
+`N` is the anthropic release counter and never resets — it increments on every PR, including across rebases onto new upstream patch versions, so the version is always monotonic.
 
-The `+anthropic.N` suffix is a semver build metadata tag — it does not affect dependency resolution but uniquely identifies our builds in Artifactory.
+Examples based on upstream 1.49.0:
+- `1.49.1000+anthropic` (first anthropic release)
+- `1.49.2000+anthropic` (second anthropic release)
+
+After rebasing onto upstream 1.49.1 (N continues):
+- `1.49.3001+anthropic`
+- `1.49.4001+anthropic`
+
+The `+anthropic` suffix is a semver build metadata tag and does not affect dependency resolution.
 
 ## Publishing
 
