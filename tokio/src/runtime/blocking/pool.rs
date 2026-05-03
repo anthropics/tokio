@@ -493,6 +493,31 @@ cfg_unstable_metrics! {
     }
 }
 
+cfg_stall_detection! {
+    /// Snapshot of blocking-pool state for the stall-detection log.
+    ///
+    /// Values are read with relaxed ordering, so they may be momentarily
+    /// inconsistent with one another.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct BlockingPoolSnapshot {
+        pub(crate) num_threads: usize,
+        pub(crate) num_idle_threads: usize,
+        pub(crate) queue_depth: usize,
+        pub(crate) thread_cap: usize,
+    }
+
+    impl Spawner {
+        pub(crate) fn stall_detection_snapshot(&self) -> BlockingPoolSnapshot {
+            BlockingPoolSnapshot {
+                num_threads: self.inner.metrics.num_threads.load(Ordering::Relaxed),
+                num_idle_threads: self.inner.metrics.num_idle_threads.load(Ordering::Relaxed),
+                queue_depth: self.inner.metrics.queue_depth.load(Ordering::Relaxed),
+                thread_cap: self.inner.thread_cap,
+            }
+        }
+    }
+}
+
 // Tells whether the error when spawning a thread is temporary.
 #[inline]
 fn is_temporary_os_thread_error(error: &io::Error) -> bool {

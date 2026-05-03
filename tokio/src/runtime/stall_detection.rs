@@ -16,6 +16,7 @@
 //! which returns EFAULT for unreadable memory. Both raw pointer reads and `write()`
 //! are POSIX async-signal-safe.
 
+use crate::runtime::blocking::BlockingPoolSnapshot;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -624,6 +625,7 @@ fn run_monitor(
     let mut worker_states = vec![WorkerState::Idle; num_workers];
     let mut stored_traces: Vec<Vec<usize>> = Vec::new();
     let mut stored_kernel_stacks: Vec<Option<String>> = Vec::new();
+    let mut stored_blocking: Vec<BlockingPoolSnapshot> = Vec::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(config.poll_interval);
@@ -639,9 +641,12 @@ fn run_monitor(
                         // Stall detected! Capture trace immediately.
                         let trace = capture_worker_trace(&metrics, i);
                         let kernel_stack = capture_worker_kernel_stack(&metrics, i);
+                        let blocking =
+                            handle.inner.blocking_spawner().stall_detection_snapshot();
                         let trace_idx = stored_traces.len();
                         stored_traces.push(trace);
                         stored_kernel_stacks.push(kernel_stack);
+                        stored_blocking.push(blocking);
                         worker_states[i] = WorkerState::WaitingForResolution {
                             stall_start: std::time::Instant::now(),
                             trace: trace_idx,
@@ -663,6 +668,7 @@ fn run_monitor(
                             duration,
                             &stored_traces[trace],
                             &stored_kernel_stacks[trace],
+                            stored_blocking[trace],
                         );
                         worker_states[i] = WorkerState::Idle;
                     } else if !*escalated && stall_start.elapsed() > config.escalation_threshold {
@@ -674,6 +680,7 @@ fn run_monitor(
                             duration,
                             &stored_traces[trace],
                             &stored_kernel_stacks[trace],
+                            stored_blocking[trace],
                         );
                         *escalated = true;
                     }
@@ -785,12 +792,17 @@ fn emit_resolved(
     duration: std::time::Duration,
     trace_ips: &[usize],
     kernel_stack: &Option<String>,
+    blocking: BlockingPoolSnapshot,
 ) {
     // Always emit via tracing for observability.
     let trace_str = format_trace(trace_ips, kernel_stack);
     tracing::warn!(
         worker = worker,
         duration_ms = duration.as_millis() as u64,
+        blocking_threads = blocking.num_threads,
+        blocking_thread_cap = blocking.thread_cap,
+        blocking_idle = blocking.num_idle_threads,
+        blocking_queued = blocking.queue_depth,
         "Scheduler stall on worker {} resolved after {:.1}ms\n{}",
         worker,
         duration.as_secs_f64() * 1000.0,
@@ -816,12 +828,17 @@ fn emit_escalation(
     duration: std::time::Duration,
     trace_ips: &[usize],
     kernel_stack: &Option<String>,
+    blocking: BlockingPoolSnapshot,
 ) {
     // Always emit via tracing for observability.
     let trace_str = format_trace(trace_ips, kernel_stack);
     tracing::error!(
         worker = worker,
         duration_s = duration.as_secs(),
+        blocking_threads = blocking.num_threads,
+        blocking_thread_cap = blocking.thread_cap,
+        blocking_idle = blocking.num_idle_threads,
+        blocking_queued = blocking.queue_depth,
         "Worker {} has been stalled for {:.1}s and counting!\n{}",
         worker,
         duration.as_secs_f64(),
