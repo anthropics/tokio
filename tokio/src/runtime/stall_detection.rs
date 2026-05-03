@@ -312,6 +312,13 @@ mod signal_impl {
             return;
         }
 
+        // Save errno before any syscalls. The interrupted thread may be in the
+        // middle of inspecting errno from a prior syscall; the write()/read()
+        // calls below would otherwise clobber it.
+        // SAFETY: __errno_location() returns the thread-local errno pointer and
+        // is async-signal-safe.
+        let saved_errno = unsafe { *libc::__errno_location() };
+
         let frames_ptr = CAPTURE.frames.get();
         let len_ptr = CAPTURE.len.get();
 
@@ -327,6 +334,9 @@ mod signal_impl {
             *len_ptr = count;
         }
         CAPTURE.done.store(true, Ordering::Release);
+
+        // SAFETY: same as the load above.
+        unsafe { *libc::__errno_location() = saved_errno };
     }
 
     /// Installs the stall signal handler. Safe to call multiple times;
