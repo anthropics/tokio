@@ -6,6 +6,10 @@
 mod pool;
 pub(crate) use pool::{spawn_blocking, BlockingPool, Spawner};
 
+cfg_stall_detection! {
+    pub(crate) use pool::BlockingPoolSnapshot;
+}
+
 cfg_fs! {
     pub(crate) use pool::spawn_mandatory_blocking;
 }
