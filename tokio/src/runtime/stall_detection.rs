@@ -471,6 +471,15 @@ fn symbolicate_trace(ips: &[usize]) -> Vec<String> {
     result
 }
 
+/// Stub for non-Linux platforms. Capture is currently Linux-only so this is
+/// usually called with an empty slice; if any IPs are passed (e.g. from a
+/// future non-Linux capture path), format them as hex so the callback still
+/// gets a usable per-frame entry.
+#[cfg(not(target_os = "linux"))]
+fn symbolicate_trace(ips: &[usize]) -> Vec<String> {
+    ips.iter().map(|ip| format!("{ip:#x}")).collect()
+}
+
 /// Reads the kernel stack trace of a thread from procfs.
 ///
 /// This provides information about what the thread is doing in kernel space
@@ -507,6 +516,13 @@ pub struct StallInfo {
     /// User-space stack trace frames (instruction pointers), if captured.
     /// Use `backtrace::resolve` to symbolicate.
     pub backtrace_frames: Vec<usize>,
+    /// Symbolicated form of `backtrace_frames`, one entry per IP.
+    ///
+    /// Populated on Linux when stack traces are available; empty otherwise
+    /// (non-Linux platforms, or when capture failed). Provided so consumers
+    /// such as Sentry forwarders can avoid re-symbolicating the same frames
+    /// the monitor thread already resolved for the log line.
+    pub symbolicated_frames: Vec<String>,
     /// Kernel stack trace, if available.
     pub kernel_stack: Option<String>,
 }
@@ -741,7 +757,11 @@ fn capture_worker_kernel_stack(
 }
 
 /// Format a symbolicated stack trace and optional kernel stack into a string.
-fn format_trace(trace_ips: &[usize], kernel_stack: &Option<String>) -> String {
+fn format_trace(
+    trace_ips: &[usize],
+    symbolicated: &[String],
+    kernel_stack: &Option<String>,
+) -> String {
     use std::fmt::Write;
     let mut output = String::new();
 
@@ -750,7 +770,6 @@ fn format_trace(trace_ips: &[usize], kernel_stack: &Option<String>) -> String {
     } else {
         #[cfg(target_os = "linux")]
         {
-            let symbolicated = symbolicate_trace(trace_ips);
             writeln!(output, "User-space stack trace at time of detection:").unwrap();
             for (j, frame) in symbolicated.iter().enumerate() {
                 writeln!(output, "  #{j}: {frame}").unwrap();
@@ -759,7 +778,7 @@ fn format_trace(trace_ips: &[usize], kernel_stack: &Option<String>) -> String {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = trace_ips;
+            let _ = symbolicated;
             writeln!(output, "  (stack traces not supported on this platform)").unwrap();
         }
     }
@@ -795,7 +814,8 @@ fn emit_resolved(
     blocking: BlockingPoolSnapshot,
 ) {
     // Always emit via tracing for observability.
-    let trace_str = format_trace(trace_ips, kernel_stack);
+    let symbolicated = symbolicate_trace(trace_ips);
+    let trace_str = format_trace(trace_ips, &symbolicated, kernel_stack);
     tracing::warn!(
         worker = worker,
         duration_ms = duration.as_millis() as u64,
@@ -816,6 +836,7 @@ fn emit_resolved(
             duration,
             resolved: true,
             backtrace_frames: trace_ips.to_vec(),
+            symbolicated_frames: symbolicated,
             kernel_stack: kernel_stack.clone(),
         });
     }
@@ -831,7 +852,8 @@ fn emit_escalation(
     blocking: BlockingPoolSnapshot,
 ) {
     // Always emit via tracing for observability.
-    let trace_str = format_trace(trace_ips, kernel_stack);
+    let symbolicated = symbolicate_trace(trace_ips);
+    let trace_str = format_trace(trace_ips, &symbolicated, kernel_stack);
     tracing::error!(
         worker = worker,
         duration_s = duration.as_secs(),
@@ -852,6 +874,7 @@ fn emit_escalation(
             duration,
             resolved: false,
             backtrace_frames: trace_ips.to_vec(),
+            symbolicated_frames: symbolicated,
             kernel_stack: kernel_stack.clone(),
         });
     }
