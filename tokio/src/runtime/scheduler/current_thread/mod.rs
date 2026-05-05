@@ -221,6 +221,14 @@ impl CurrentThread {
                             .worker_metrics
                             .os_thread_id
                             .store(tid, std::sync::atomic::Ordering::Release);
+
+                        if let Some(name) = thread::current().name() {
+                            let _ = handle
+                                .shared
+                                .worker_metrics
+                                .thread_name
+                                .set(name.to_string());
+                        }
                     }
                     return core.block_on(future);
                 } else {

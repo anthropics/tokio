@@ -391,9 +391,14 @@ where
                                 #[cfg(not(target_os = "linux"))]
                                 let tid = 0u64;
 
-                                cx.worker.handle.shared.worker_metrics[cx.worker.index]
+                                let metrics =
+                                    &cx.worker.handle.shared.worker_metrics[cx.worker.index];
+                                metrics
                                     .os_thread_id
                                     .store(tid, std::sync::atomic::Ordering::Release);
+                                if let Some(name) = thread::current().name() {
+                                    let _ = metrics.thread_name.set(name.to_string());
+                                }
                             }
                         }
 
