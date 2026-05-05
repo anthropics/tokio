@@ -146,6 +146,30 @@ impl RuntimeMetrics {
                 .os_thread_id
                 .load(std::sync::atomic::Ordering::Acquire)
         }
+
+        /// Returns the name of the thread currently running the given worker.
+        ///
+        /// Captured once at worker startup from `std::thread::current().name()`.
+        /// Returns `None` if the worker has not started yet or its OS thread had
+        /// no name.
+        ///
+        /// # Arguments
+        ///
+        /// `worker` is the index of the worker being queried. The given value must
+        /// be between 0 and `num_workers()`.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()`.
+        pub fn worker_thread_name(&self, worker: usize) -> Option<&str> {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .thread_name
+                .get()
+                .map(String::as_str)
+        }
     }
 
     cfg_64bit_metrics! {

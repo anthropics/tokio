@@ -73,6 +73,12 @@ pub(crate) struct WorkerMetrics {
     /// OS thread ID of the worker thread (e.g. from gettid() on Linux). 0 = unset.
     #[cfg(feature = "stall-detection")]
     pub(crate) os_thread_id: std::sync::atomic::AtomicU64,
+
+    /// Name of the worker thread, captured once at startup from
+    /// `std::thread::current().name()`. Unset if the worker has not started
+    /// or its OS thread had no name.
+    #[cfg(feature = "stall-detection")]
+    pub(crate) thread_name: std::sync::OnceLock<String>,
 }
 
 impl WorkerMetrics {
