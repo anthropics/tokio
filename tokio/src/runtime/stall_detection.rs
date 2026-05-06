@@ -492,6 +492,7 @@ fn capture_kernel_stack(os_tid: u64) -> Option<String> {
     std::fs::read_to_string(&path).ok()
 }
 
+
 // --- Per-worker monitor state ---
 
 #[derive(Clone, Copy, PartialEq)]
@@ -499,7 +500,7 @@ enum WorkerState {
     Idle,
     WaitingForResolution {
         stall_start: std::time::Instant,
-        trace: usize, // index into stored_traces and stored_kernel_stacks
+        trace: usize, // index into stored_traces, stored_kernel_stacks, stored_thread_names, stored_blocking
         escalated: bool,
     },
 }
@@ -525,6 +526,14 @@ pub struct StallInfo {
     pub symbolicated_frames: Vec<String>,
     /// Kernel stack trace, if available.
     pub kernel_stack: Option<String>,
+    /// Name of the stalled worker thread, captured at startup from
+    /// `std::thread::current().name()`.
+    ///
+    /// This is the value configured via `Builder::thread_name(...)` /
+    /// `Builder::thread_name_fn(...)` (default: `"tokio-runtime-worker"`),
+    /// not the kernel-truncated `comm`. `None` if the worker had no thread
+    /// name set.
+    pub thread_name: Option<String>,
 }
 
 /// Callback type for stall events.
@@ -642,6 +651,7 @@ fn run_monitor(
     let mut stored_traces: Vec<Vec<usize>> = Vec::new();
     let mut stored_kernel_stacks: Vec<Option<String>> = Vec::new();
     let mut stored_blocking: Vec<BlockingPoolSnapshot> = Vec::new();
+    let mut stored_thread_names: Vec<Option<String>> = Vec::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(config.poll_interval);
@@ -657,11 +667,13 @@ fn run_monitor(
                         // Stall detected! Capture trace immediately.
                         let trace = capture_worker_trace(&metrics, i);
                         let kernel_stack = capture_worker_kernel_stack(&metrics, i);
+                        let thread_name = capture_worker_thread_name_for(&metrics, i);
                         let blocking =
                             handle.inner.blocking_spawner().stall_detection_snapshot();
                         let trace_idx = stored_traces.len();
                         stored_traces.push(trace);
                         stored_kernel_stacks.push(kernel_stack);
+                        stored_thread_names.push(thread_name);
                         stored_blocking.push(blocking);
                         worker_states[i] = WorkerState::WaitingForResolution {
                             stall_start: std::time::Instant::now(),
@@ -684,6 +696,7 @@ fn run_monitor(
                             duration,
                             &stored_traces[trace],
                             &stored_kernel_stacks[trace],
+                            &stored_thread_names[trace],
                             stored_blocking[trace],
                         );
                         worker_states[i] = WorkerState::Idle;
@@ -696,6 +709,7 @@ fn run_monitor(
                             duration,
                             &stored_traces[trace],
                             &stored_kernel_stacks[trace],
+                            &stored_thread_names[trace],
                             stored_blocking[trace],
                         );
                         *escalated = true;
@@ -756,6 +770,14 @@ fn capture_worker_kernel_stack(
     }
 }
 
+/// Look up the worker's thread name as recorded by the worker at startup.
+fn capture_worker_thread_name_for(
+    metrics: &crate::runtime::RuntimeMetrics,
+    worker: usize,
+) -> Option<String> {
+    metrics.worker_thread_name(worker).map(str::to_owned)
+}
+
 /// Format a symbolicated stack trace and optional kernel stack into a string.
 fn format_trace(
     trace_ips: &[usize],
@@ -811,6 +833,7 @@ fn emit_resolved(
     duration: std::time::Duration,
     trace_ips: &[usize],
     kernel_stack: &Option<String>,
+    thread_name: &Option<String>,
     blocking: BlockingPoolSnapshot,
 ) {
     // Always emit via tracing for observability.
@@ -818,6 +841,7 @@ fn emit_resolved(
     let trace_str = format_trace(trace_ips, &symbolicated, kernel_stack);
     tracing::warn!(
         worker = worker,
+        thread_name = thread_name.as_deref(),
         duration_ms = duration.as_millis() as u64,
         blocking_threads = blocking.num_threads,
         blocking_thread_cap = blocking.thread_cap,
@@ -838,6 +862,7 @@ fn emit_resolved(
             backtrace_frames: trace_ips.to_vec(),
             symbolicated_frames: symbolicated,
             kernel_stack: kernel_stack.clone(),
+            thread_name: thread_name.clone(),
         });
     }
 }
@@ -849,6 +874,7 @@ fn emit_escalation(
     duration: std::time::Duration,
     trace_ips: &[usize],
     kernel_stack: &Option<String>,
+    thread_name: &Option<String>,
     blocking: BlockingPoolSnapshot,
 ) {
     // Always emit via tracing for observability.
@@ -856,6 +882,7 @@ fn emit_escalation(
     let trace_str = format_trace(trace_ips, &symbolicated, kernel_stack);
     tracing::error!(
         worker = worker,
+        thread_name = thread_name.as_deref(),
         duration_s = duration.as_secs(),
         blocking_threads = blocking.num_threads,
         blocking_thread_cap = blocking.thread_cap,
@@ -876,6 +903,7 @@ fn emit_escalation(
             backtrace_frames: trace_ips.to_vec(),
             symbolicated_frames: symbolicated,
             kernel_stack: kernel_stack.clone(),
+            thread_name: thread_name.clone(),
         });
     }
 }
