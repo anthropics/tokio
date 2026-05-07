@@ -382,3 +382,62 @@ fn shutdown_timeout_stops_monitor() {
         elapsed
     );
 }
+
+/// Verify that the on_stall callback receives a populated `StallInfo`,
+/// including the worker thread name configured via `Builder::thread_name`.
+///
+/// This in particular guards the multi-thread `fn run()` startup path that
+/// records `WorkerMetrics::thread_name`: if a worker reaches its first stall
+/// without that path having run, `thread_name` would still be unset.
+#[test]
+fn on_stall_callback_receives_thread_name() {
+    use std::sync::{Arc, Mutex};
+
+    let events: Arc<Mutex<Vec<tokio::runtime::StallInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_cb = events.clone();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("stall-test-worker")
+        .enable_stall_detection()
+        .stall_detection_poll_interval(std::time::Duration::from_millis(50))
+        .stall_detection_escalation_threshold(std::time::Duration::from_secs(60))
+        .on_stall(move |info| {
+            events_cb.lock().unwrap().push(info);
+        })
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        tokio::spawn(async {
+            // Block the worker long enough for the 50ms poller to see two
+            // consecutive identical odd generations.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        })
+        .await
+        .unwrap();
+    });
+
+    // Give the monitor a moment to observe the resolved stall and run the callback.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    let events = events.lock().unwrap();
+    assert!(
+        !events.is_empty(),
+        "expected at least one stall event, got none"
+    );
+
+    let info = &events[0];
+    assert_eq!(info.worker, 0);
+    assert!(info.duration >= std::time::Duration::from_millis(100));
+    assert_eq!(
+        info.thread_name.as_deref(),
+        Some("stall-test-worker"),
+        "thread_name should reflect Builder::thread_name(...)"
+    );
+    // backtrace_frames and symbolicated_frames must be the same length so
+    // consumers can zip them.
+    assert_eq!(info.backtrace_frames.len(), info.symbolicated_frames.len());
+}
