@@ -446,6 +446,16 @@ mod signal_impl {
 
 /// Symbolicate a captured trace: resolve instruction pointers to human-readable
 /// symbol names, file paths, and line numbers.
+///
+/// This is expensive — `backtrace::resolve` parses each mapped object's DWARF
+/// debug info and caches at most 4 mappings globally (`MAPPINGS_CACHE_SIZE` in
+/// the `backtrace` crate). Processes with dozens of loaded `.so`s thrash that
+/// cache, so every call re-parses ELF/DWARF for most frames (~MBs of
+/// allocations per call). It also takes the `backtrace` crate's global cache
+/// mutex, so it can block any concurrent resolver in the process (e.g. an
+/// `eyre::Report` backtrace) and, if that blocked caller is itself a tokio
+/// worker inside `poll`, trigger another stall detection — a feedback loop.
+/// Callers on a hot path should rate-limit via [`SymbolicationLimiter`].
 #[cfg(target_os = "linux")]
 fn symbolicate_trace(ips: &[usize]) -> Vec<String> {
     use std::ffi::c_void;
@@ -478,6 +488,60 @@ fn symbolicate_trace(ips: &[usize]) -> Vec<String> {
 #[cfg(not(target_os = "linux"))]
 fn symbolicate_trace(ips: &[usize]) -> Vec<String> {
     ips.iter().map(|ip| format!("{ip:#x}")).collect()
+}
+
+/// Rate limiter for stall-trace symbolication.
+///
+/// `symbolicate_trace` is too expensive to run on every detected stall when
+/// stalls are frequent (see its doc comment for why). This limiter permits at
+/// most one symbolication per `min_interval`. Escalations (stalls that cross
+/// `escalation_threshold`) always symbolicate regardless — they are rare and
+/// the cost is justified.
+///
+/// Held by the monitor thread only; not `Sync`.
+struct SymbolicationLimiter {
+    min_interval: std::time::Duration,
+    /// Time of the last *permitted* symbolication. `None` until the first
+    /// request so the first stall always symbolicates.
+    last: Option<std::time::Instant>,
+    /// Count of stalls skipped since the last permitted symbolication. Emitted
+    /// in the log line of the next permitted stall so operators can see how
+    /// much the limiter is suppressing.
+    skipped_since_last: u64,
+}
+
+impl SymbolicationLimiter {
+    fn new(min_interval: std::time::Duration) -> Self {
+        Self {
+            min_interval,
+            last: None,
+            skipped_since_last: 0,
+        }
+    }
+
+    /// Decide whether to symbolicate a resolved stall. Returns
+    /// `Some(skipped_count)` (the number of stalls since the last permitted
+    /// symbolication) if the caller should symbolicate now, or `None` if it
+    /// should skip and use raw IPs.
+    ///
+    /// A zero `min_interval` disables rate-limiting.
+    fn check(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.min_interval.is_zero() {
+            return Some(0);
+        }
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < self.min_interval => {
+                self.skipped_since_last += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                let skipped = self.skipped_since_last;
+                self.skipped_since_last = 0;
+                Some(skipped)
+            }
+        }
+    }
 }
 
 /// Reads the kernel stack trace of a thread from procfs.
@@ -547,6 +611,19 @@ pub(crate) struct StallDetectionConfig {
     pub(crate) poll_interval: std::time::Duration,
     /// How long a stall must persist before emitting an intermediate "still stalled" warning.
     pub(crate) escalation_threshold: std::time::Duration,
+    /// Minimum interval between symbolicated resolved-stall reports. Resolved
+    /// stalls that arrive faster than this are still reported via `tracing`
+    /// and the `on_stall` callback, but with raw instruction pointers instead
+    /// of symbolicated frames. Escalated stalls (those that cross
+    /// `escalation_threshold`) always symbolicate.
+    ///
+    /// Symbolication is expensive and contends on a global lock — see
+    /// [`symbolicate_trace`]. When a workload stalls frequently (e.g.
+    /// synchronous I/O inside `poll`), symbolicating every resolved stall
+    /// dominates the monitor thread's allocation profile and can itself
+    /// provoke further stalls. Zero disables the limit (symbolicate every
+    /// resolved stall — the pre-limiter behavior).
+    pub(crate) min_symbolication_interval: std::time::Duration,
     /// Optional callback for stall events. Stall events are always reported via
     /// `tracing` regardless of whether a callback is set.
     pub(crate) on_stall: Option<StallCallback>,
@@ -557,6 +634,7 @@ impl Clone for StallDetectionConfig {
         Self {
             poll_interval: self.poll_interval,
             escalation_threshold: self.escalation_threshold,
+            min_symbolication_interval: self.min_symbolication_interval,
             on_stall: self.on_stall.clone(),
         }
     }
@@ -567,6 +645,7 @@ impl std::fmt::Debug for StallDetectionConfig {
         f.debug_struct("StallDetectionConfig")
             .field("poll_interval", &self.poll_interval)
             .field("escalation_threshold", &self.escalation_threshold)
+            .field("min_symbolication_interval", &self.min_symbolication_interval)
             .field("on_stall", &self.on_stall.as_ref().map(|_| "<callback>"))
             .finish()
     }
@@ -577,6 +656,11 @@ impl Default for StallDetectionConfig {
         Self {
             poll_interval: std::time::Duration::from_millis(100),
             escalation_threshold: std::time::Duration::from_secs(10),
+            // Default to the escalation threshold: resolved stalls get one
+            // symbolicated sample every ten seconds (plus any escalations),
+            // which is enough to identify what's stalling without turning the
+            // monitor thread into an allocator hot spot.
+            min_symbolication_interval: std::time::Duration::from_secs(10),
             on_stall: None,
         }
     }
@@ -652,6 +736,8 @@ fn run_monitor(
     let mut stored_kernel_stacks: Vec<Option<String>> = Vec::new();
     let mut stored_blocking: Vec<BlockingPoolSnapshot> = Vec::new();
     let mut stored_thread_names: Vec<Option<String>> = Vec::new();
+    let mut symbolication_limiter =
+        SymbolicationLimiter::new(config.min_symbolication_interval);
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(config.poll_interval);
@@ -688,8 +774,14 @@ fn run_monitor(
                     ref mut escalated,
                 } => {
                     if gen != prev_gen[i] {
-                        // Stall resolved
+                        // Stall resolved. Symbolicating every resolved stall is
+                        // too expensive when stalls are frequent — see
+                        // `SymbolicationLimiter` and the `symbolicate_trace`
+                        // doc comment. Rate-limit here; escalations below
+                        // always symbolicate.
                         let duration = stall_start.elapsed();
+                        let symbolicate_skipped = symbolication_limiter
+                            .check(std::time::Instant::now());
                         emit_resolved(
                             &config.on_stall,
                             i,
@@ -698,6 +790,7 @@ fn run_monitor(
                             &stored_kernel_stacks[trace],
                             &stored_thread_names[trace],
                             stored_blocking[trace],
+                            symbolicate_skipped,
                         );
                         worker_states[i] = WorkerState::Idle;
                     } else if !*escalated && stall_start.elapsed() > config.escalation_threshold {
@@ -827,6 +920,14 @@ fn format_trace(
 }
 
 /// Emit a stall-resolved event via tracing and optionally via callback.
+///
+/// `symbolicate_skipped` is `Some(n)` if the caller's [`SymbolicationLimiter`]
+/// permits symbolicating this event (`n` is the count of prior resolved stalls
+/// that were *not* symbolicated since the last permitted one). `None` means the
+/// limiter suppressed symbolication — the event is still emitted, but with raw
+/// instruction pointers, so that stall *counting* is never rate-limited, only
+/// the expensive symbol resolution.
+#[allow(clippy::too_many_arguments)]
 fn emit_resolved(
     on_stall: &Option<StallCallback>,
     worker: usize,
@@ -835,9 +936,18 @@ fn emit_resolved(
     kernel_stack: &Option<String>,
     thread_name: &Option<String>,
     blocking: BlockingPoolSnapshot,
+    symbolicate_skipped: Option<u64>,
 ) {
-    // Always emit via tracing for observability.
-    let symbolicated = symbolicate_trace(trace_ips);
+    // Always emit via tracing for observability. Only run the expensive
+    // `backtrace::resolve` symbolication when the rate limiter permits it —
+    // the stall *count* is never suppressed. When rate-limited, format each
+    // IP as hex so `symbolicated_frames.len() == backtrace_frames.len()`
+    // still holds for callback consumers that zip the two, and a log reader
+    // can still offline-symbolicate against the pod's /proc/self/maps.
+    let symbolicated = match symbolicate_skipped {
+        Some(_) => symbolicate_trace(trace_ips),
+        None => trace_ips.iter().map(|ip| format!("{ip:#x}")).collect(),
+    };
     let trace_str = format_trace(trace_ips, &symbolicated, kernel_stack);
     tracing::warn!(
         worker = worker,
@@ -847,6 +957,7 @@ fn emit_resolved(
         blocking_thread_cap = blocking.thread_cap,
         blocking_idle = blocking.num_idle_threads,
         blocking_queued = blocking.queue_depth,
+        symbolication_skipped_since_last = symbolicate_skipped,
         "Scheduler stall on worker {} resolved after {:.1}ms\n{}",
         worker,
         duration.as_secs_f64() * 1000.0,
@@ -905,5 +1016,63 @@ fn emit_escalation(
             kernel_stack: kernel_stack.clone(),
             thread_name: thread_name.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn limiter_permits_first_request() {
+        let mut l = SymbolicationLimiter::new(Duration::from_secs(10));
+        // The first request after construction always symbolicates, with zero
+        // prior skips — there is nothing to rate-limit against yet.
+        assert_eq!(l.check(Instant::now()), Some(0));
+    }
+
+    #[test]
+    fn limiter_suppresses_within_interval() {
+        let t0 = Instant::now();
+        let mut l = SymbolicationLimiter::new(Duration::from_secs(10));
+        assert_eq!(l.check(t0), Some(0));
+        // 1s later — still inside the 10s window, suppressed.
+        assert_eq!(l.check(t0 + Duration::from_secs(1)), None);
+        assert_eq!(l.check(t0 + Duration::from_secs(5)), None);
+        assert_eq!(l.check(t0 + Duration::from_secs(9)), None);
+        // 10s later — permitted, and reports 3 suppressed stalls since the
+        // last symbolication so operators can gauge how hot the loop is.
+        assert_eq!(l.check(t0 + Duration::from_secs(10)), Some(3));
+        // The skip counter resets after every permitted symbolication.
+        assert_eq!(l.check(t0 + Duration::from_secs(11)), None);
+        assert_eq!(l.check(t0 + Duration::from_secs(20)), Some(1));
+    }
+
+    #[test]
+    fn limiter_zero_interval_disables() {
+        // Duration::ZERO is the escape hatch to restore the pre-limiter
+        // behavior (symbolicate every resolved stall). It must never
+        // suppress.
+        let t0 = Instant::now();
+        let mut l = SymbolicationLimiter::new(Duration::ZERO);
+        for i in 0..5 {
+            assert_eq!(l.check(t0 + Duration::from_millis(i)), Some(0));
+        }
+    }
+
+    #[test]
+    fn limiter_handles_clock_skew() {
+        // `Instant::now()` is monotonic, but the monitor loop computes the
+        // check time itself and a caller bug could pass a stale timestamp.
+        // `saturating_duration_since` makes that a no-op (treated as 0
+        // elapsed) rather than a panic or a wraparound that permanently
+        // unlocks the limiter.
+        let t0 = Instant::now();
+        let mut l = SymbolicationLimiter::new(Duration::from_secs(10));
+        assert_eq!(l.check(t0 + Duration::from_secs(100)), Some(0));
+        // A timestamp *before* the last permitted one must still be
+        // suppressed, not panic.
+        assert_eq!(l.check(t0), None);
     }
 }
