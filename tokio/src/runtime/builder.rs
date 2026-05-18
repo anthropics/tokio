@@ -482,6 +482,56 @@ impl Builder {
         self
     }
 
+    /// Set the minimum interval between *symbolicated* resolved-stall reports.
+    ///
+    /// Stalls that resolve faster than this interval are still detected,
+    /// counted, and reported via `tracing` and the `on_stall` callback, but
+    /// with raw instruction pointers instead of symbolicated frames. Escalated
+    /// stalls (those that cross `stall_detection_escalation_threshold`) always
+    /// symbolicate regardless.
+    ///
+    /// Symbolication parses each mapped object's DWARF debug info under a
+    /// global lock in the `backtrace` crate. When a workload stalls frequently
+    /// (e.g. synchronous I/O inside `poll`), symbolicating every resolved
+    /// stall dominates the monitor thread's allocation profile and can itself
+    /// provoke further stalls by blocking other in-process `backtrace`
+    /// consumers. This limit bounds that cost without suppressing stall
+    /// *counting*. Pass `Duration::ZERO` to disable the limit and symbolicate
+    /// every resolved stall.
+    ///
+    /// Defaults to the escalation threshold's default (10 seconds).
+    ///
+    /// If stall detection has not been explicitly enabled, calling this method
+    /// will enable it with default values before applying the threshold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// use tokio::runtime;
+    /// use std::time::Duration;
+    ///
+    /// let rt = runtime::Builder::new_multi_thread()
+    ///     .enable_stall_detection()
+    ///     .stall_detection_min_symbolication_interval(Duration::from_secs(5))
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(feature = "stall-detection")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stall-detection")))]
+    pub fn stall_detection_min_symbolication_interval(
+        &mut self,
+        interval: std::time::Duration,
+    ) -> &mut Self {
+        self.stall_detection_config
+            .get_or_insert_with(crate::runtime::stall_detection::StallDetectionConfig::default)
+            .min_symbolication_interval = interval;
+        self
+    }
+
     /// Set a callback to be invoked when a scheduler stall is detected or resolved.
     ///
     /// The callback receives a [`StallInfo`] with the worker index, duration, stack trace,

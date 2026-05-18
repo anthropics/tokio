@@ -441,3 +441,141 @@ fn on_stall_callback_receives_thread_name() {
     // consumers can zip them.
     assert_eq!(info.backtrace_frames.len(), info.symbolicated_frames.len());
 }
+
+/// Verify that the symbolication rate limiter suppresses symbol resolution for
+/// closely-spaced resolved stalls while still reporting each stall via the
+/// callback. Escalations are covered by `monitor_detects_stall`.
+#[test]
+#[cfg(target_os = "linux")]
+fn rate_limits_symbolication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let symbolicated_count = Arc::new(AtomicUsize::new(0));
+    let total_count = Arc::new(AtomicUsize::new(0));
+    let sc = symbolicated_count.clone();
+    let tc = total_count.clone();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_stall_detection()
+        .stall_detection_poll_interval(std::time::Duration::from_millis(50))
+        .stall_detection_escalation_threshold(std::time::Duration::from_secs(60))
+        // Large enough that the three stalls below all land inside one window:
+        // only the first should get a symbolicated trace.
+        .stall_detection_min_symbolication_interval(std::time::Duration::from_secs(60))
+        .on_stall(move |info| {
+            if info.resolved {
+                tc.fetch_add(1, Ordering::SeqCst);
+                // The length invariant holds regardless of rate-limiting:
+                // suppressed events pad with hex IPs rather than an empty vec.
+                assert_eq!(
+                    info.backtrace_frames.len(),
+                    info.symbolicated_frames.len()
+                );
+                assert!(!info.backtrace_frames.is_empty());
+                // A rate-limited event has hex-only frames; a symbolicated
+                // event has at least one frame with a resolved symbol name
+                // (the test build retains debug info, so `thread::sleep` and
+                // the tokio runtime frames resolve).
+                let symbolicated = info
+                    .symbolicated_frames
+                    .iter()
+                    .any(|f| !f.starts_with("0x"));
+                if symbolicated {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        for _ in 0..3 {
+            tokio::spawn(async {
+                // 300ms block with a 50ms poll interval — comfortably detected.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })
+            .await
+            .unwrap();
+            // Let the monitor observe the resolution before the next stall.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    });
+    // Let the monitor's final poll land.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    let total = total_count.load(Ordering::SeqCst);
+    let symbolicated = symbolicated_count.load(Ordering::SeqCst);
+    // All three stalls are detected and reported; timing jitter in CI can
+    // occasionally merge or drop one, so the lower bound is generous.
+    assert!(
+        total >= 2,
+        "expected at least 2 resolved stalls, got {total}"
+    );
+    // The rate limiter permits at most one symbolication inside the 60s
+    // window, and the first request always symbolicates.
+    assert_eq!(
+        symbolicated, 1,
+        "expected exactly 1 symbolicated stall (rate-limited), got {symbolicated} of {total}"
+    );
+}
+
+/// Verify that a zero `min_symbolication_interval` disables the rate limiter —
+/// the escape hatch to the pre-limiter behavior.
+#[test]
+#[cfg(target_os = "linux")]
+fn zero_interval_symbolicates_every_stall() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let symbolicated_count = Arc::new(AtomicUsize::new(0));
+    let total_count = Arc::new(AtomicUsize::new(0));
+    let sc = symbolicated_count.clone();
+    let tc = total_count.clone();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_stall_detection()
+        .stall_detection_poll_interval(std::time::Duration::from_millis(50))
+        .stall_detection_escalation_threshold(std::time::Duration::from_secs(60))
+        .stall_detection_min_symbolication_interval(std::time::Duration::ZERO)
+        .on_stall(move |info| {
+            if info.resolved {
+                tc.fetch_add(1, Ordering::SeqCst);
+                if info
+                    .symbolicated_frames
+                    .iter()
+                    .any(|f| !f.starts_with("0x"))
+                {
+                    sc.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        for _ in 0..3 {
+            tokio::spawn(async {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    let total = total_count.load(Ordering::SeqCst);
+    let symbolicated = symbolicated_count.load(Ordering::SeqCst);
+    assert!(total >= 2, "expected at least 2 resolved stalls, got {total}");
+    assert_eq!(
+        symbolicated, total,
+        "with zero interval every stall should symbolicate"
+    );
+}
