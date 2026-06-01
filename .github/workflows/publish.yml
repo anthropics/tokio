@@ -3,13 +3,13 @@
 # - Only two external actions: actions/checkout (GitHub-owned) and
 #   jfrog/setup-jfrog-cli (allowlisted, handles OIDC auth)
 # - Rust toolchain uses the runner's pre-installed rustup
-# - The publish environment requires the anthropic-1.49.0 branch
+# - The publish environment requires the anthropic-1.52.3 branch
 name: Publish to Artifactory
 
 on:
   push:
     branches:
-      - anthropic-1.49.0
+      - anthropic-1.52.3
 
 permissions:
   contents: read

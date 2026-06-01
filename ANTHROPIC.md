@@ -9,6 +9,7 @@ Versions use the upstream major.minor with a fork-owned patch number `P = N * 10
 - `1.49.1000+anthropic` = first fork release based on tokio 1.49.0
 - `1.49.2000+anthropic` = second fork release
 - `1.49.3001+anthropic` = third fork release, after rebasing onto tokio 1.49.1
+- `1.52.7003+anthropic` = seventh fork release, after rebasing onto tokio 1.52.3
 
 ## Features Added
 
@@ -27,7 +28,7 @@ let rt = tokio::runtime::Builder::new_multi_thread()
 
 ## Publishing
 
-Publishing happens automatically when changes are pushed to the `anthropic-1.49.0` branch. The GitHub Actions workflow uses OIDC authentication with Artifactory.
+Publishing happens automatically when changes are pushed to the `anthropic-1.52.3` branch. The GitHub Actions workflow uses OIDC authentication with Artifactory.
 
 ### Prerequisites
 
@@ -41,5 +42,5 @@ In the workspace `Cargo.toml`:
 
 ```toml
 [patch.crates-io]
-tokio = { version = "1.49.1000+anthropic", registry = "crates-internal" }
+tokio = { version = "1.52.7003+anthropic", registry = "crates-internal" }
 ```
