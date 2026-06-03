@@ -26,6 +26,19 @@ let rt = tokio::runtime::Builder::new_multi_thread()
     .unwrap();
 ```
 
+### Deterministic time stepping (`test-util`)
+
+Extensions to the paused-clock (`tokio::time::pause()`) machinery for
+deterministic simulation and stepped testing, all gated on the `test-util`
+feature:
+
+- `tokio::time::quiesce()` / `quiesce_until(deadline)`: run a paused
+  `current_thread` runtime until nothing more can happen at or below the
+  given virtual-time bound, land the clock exactly on the bound, and report
+  when the next pending timer is due.
+
+See the rustdoc on those functions for the full contracts.
+
 ## Publishing
 
 Publishing happens automatically when changes are pushed to the `anthropic-1.52.3` branch. The GitHub Actions workflow uses OIDC authentication with Artifactory.

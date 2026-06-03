@@ -33,6 +33,17 @@ impl TimeSource {
         Duration::from_millis(t)
     }
 
+    /// Converts a wheel tick back to an `Instant`.
+    ///
+    /// Saturates to `Instant::far_future()` if the tick does not fit (mirrors how
+    /// `instant_to_tick` saturates at `MAX_SAFE_MILLIS_DURATION`).
+    #[cfg(feature = "test-util")]
+    pub(crate) fn tick_to_instant(&self, tick: u64) -> Instant {
+        self.start_time
+            .checked_add(Duration::from_millis(tick))
+            .unwrap_or_else(Instant::far_future)
+    }
+
     pub(crate) fn now(&self, clock: &Clock) -> u64 {
         self.instant_to_tick(clock.now())
     }

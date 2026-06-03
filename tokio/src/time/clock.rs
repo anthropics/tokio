@@ -49,6 +49,25 @@ cfg_test_util! {
                 Err(msg) => panic!("{}", msg),
             }
         }
+
+        /// Panics if any quiesce waiter is registered on the current runtime's time
+        /// driver. `resume()` and `advance()` are mutually exclusive with an
+        /// in-progress `quiesce()` step: both would move the clock out from under the
+        /// step and break its reproducibility contract.
+        #[track_caller]
+        fn panic_if_quiesce_waiters(api: &str) {
+            use crate::runtime::Handle;
+
+            if let Ok(handle) = Handle::try_current() {
+                if let Some(time_handle) = handle.inner.driver().time.as_ref() {
+                    if time_handle.has_quiesce_waiters() {
+                        panic!(
+                            "`time::{api}()` cannot be called while a `quiesce()` is in progress"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     cfg_not_rt! {
@@ -87,7 +106,9 @@ cfg_test_util! {
         /// Instant at which the clock was last unfrozen.
         unfrozen: Option<std::time::Instant>,
 
-        /// Number of `inhibit_auto_advance` calls still in effect.
+        /// Number of `inhibit_auto_advance` calls still in effect; one is held
+        /// for each outstanding `spawn_blocking` task, because a blocking task
+        /// implies future work.
         auto_advance_inhibit_count: usize,
     }
 
@@ -124,6 +145,9 @@ cfg_test_util! {
     /// other timer-backed primitives can cause the runtime to advance the
     /// current time when awaited.
     ///
+    /// A paused runtime can be stepped through virtual time deterministically
+    /// with [`quiesce_until`].
+    ///
     /// # Preventing auto-advance
     ///
     /// In some testing scenarios, you may want to keep the clock paused without
@@ -157,6 +181,7 @@ cfg_test_util! {
     /// [`Sleep`]: crate::time::Sleep
     /// [`advance`]: crate::time::advance
     /// [`spawn_blocking`]: crate::task::spawn_blocking
+    /// [`quiesce_until`]: crate::time::quiesce_until
     #[track_caller]
     pub fn pause() {
         with_clock(|maybe_clock| {
@@ -174,10 +199,14 @@ cfg_test_util! {
     ///
     /// # Panics
     ///
-    /// Panics if time is not frozen or if called from outside of the Tokio
-    /// runtime.
+    /// Panics if time is not frozen, if called from outside of the Tokio
+    /// runtime, or if a [`quiesce`] step is in progress on this runtime
+    /// (quiescence stepping and a running wall clock are mutually exclusive).
+    ///
+    /// [`quiesce`]: crate::time::quiesce()
     #[track_caller]
     pub fn resume() {
+        panic_if_quiesce_waiters("resume");
         with_clock(|maybe_clock| {
             let clock = match maybe_clock {
                 Some(clock) => clock,
@@ -254,6 +283,9 @@ cfg_test_util! {
     /// - If called outside of the Tokio runtime.
     /// - If the input `duration` is too large (such as [`Duration::MAX`])
     ///   to be safely added to the current time without causing an overflow.
+    /// - If a [`quiesce`] step is in progress on this runtime. The two APIs are
+    ///   mutually exclusive: an explicit advance during a step would move the
+    ///   clock past the step's bound.
     ///
     /// # Caveats
     ///
@@ -267,7 +299,9 @@ cfg_test_util! {
     /// details.
     ///
     /// [`sleep`]: fn@crate::time::sleep
+    /// [`quiesce`]: crate::time::quiesce()
     pub async fn advance(duration: Duration) {
+        panic_if_quiesce_waiters("advance");
         with_clock(|maybe_clock| {
             let clock = match maybe_clock {
                 Some(clock) => clock,
@@ -324,7 +358,7 @@ cfg_test_util! {
 
             if !inner.enable_pausing {
                 return Err("`time::pause()` requires the `current_thread` Tokio runtime. \
-                        This is the default Runtime used by `#[tokio::test].");
+                        This is the default Runtime used by `#[tokio::test]`.");
             }
 
             // Track that we paused the clock
@@ -356,6 +390,21 @@ cfg_test_util! {
             inner.unfrozen.is_none() && inner.auto_advance_inhibit_count == 0
         }
 
+        /// Returns true if any auto-advance inhibit is in effect — one is held for
+        /// each outstanding `spawn_blocking` task spawned on this runtime. Used by
+        /// the quiesce drain-park hook: outstanding blocking work implies future
+        /// wakes, so the runtime is not quiescent.
+        pub(crate) fn has_auto_advance_inhibits(&self) -> bool {
+            let inner = self.inner.lock();
+            inner.auto_advance_inhibit_count > 0
+        }
+
+        /// Returns true if the clock is currently paused (frozen).
+        pub(crate) fn is_paused(&self) -> bool {
+            let inner = self.inner.lock();
+            inner.unfrozen.is_none()
+        }
+
         pub(crate) fn advance(&self, duration: Duration) -> Result<(), &'static str> {
             let mut inner = self.inner.lock();
 
@@ -365,6 +414,26 @@ cfg_test_util! {
 
             inner.base += duration;
             Ok(())
+        }
+
+        /// Applies an auto-advance of `duration` if auto-advance is still
+        /// allowed -- clock paused, no inhibits -- with the re-check and the
+        /// advance under one lock acquisition. Returns whether the advance was
+        /// applied.
+        ///
+        /// The driver decides to auto-advance (via `can_auto_advance`) before
+        /// parking; an inhibit taken (a `spawn_blocking` task spawned from
+        /// another thread), or a `resume()` landing, between that decision and
+        /// the advance must veto the advance rather than race it.
+        pub(crate) fn try_auto_advance(&self, duration: Duration) -> bool {
+            let mut inner = self.inner.lock();
+
+            if inner.unfrozen.is_some() || inner.auto_advance_inhibit_count > 0 {
+                return false;
+            }
+
+            inner.base += duration;
+            true
         }
 
         pub(crate) fn now(&self) -> Instant {
