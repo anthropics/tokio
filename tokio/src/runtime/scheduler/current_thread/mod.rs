@@ -539,10 +539,11 @@ impl Context {
     ///     have been consumed and will terminate the park.
     ///
     ///  5. Otherwise resolves the registered step (at most one is in progress)
-    ///     when its bound lies strictly below the wheel's next expiration (or
-    ///     unconditionally when the wheel is empty), waking the waiter inside this
-    ///     `enter` scope. Resolution lands the clock exactly on the step's bound
-    ///     -- a move the resolution condition proves crosses no timer.
+    ///     when its bound lies strictly below the earliest pending deadline across
+    ///     the exact store and the wheel (or unconditionally when both are empty),
+    ///     waking the waiter inside this `enter` scope. Resolution lands the clock
+    ///     exactly on the step's bound -- a move the resolution condition proves
+    ///     crosses no timer.
     ///
     /// Returns `(core, skip_park)`. `skip_park` is true when runnable work was
     /// discovered (step 3) or the step resolved (step 5); the caller must then

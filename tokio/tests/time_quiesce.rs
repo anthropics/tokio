@@ -28,7 +28,7 @@ async fn quiesce_until_fires_timers_within_bound() {
     assert_eq!(fired.load(SeqCst), 3);
     // The last timer fires exactly at the bound; the clock lands on it.
     assert_eq!(state.now, start + Duration::from_millis(30));
-    // The 40ms timer is within 64ms of `now` => bottom wheel level => exact.
+    // The 40ms timer was registered while paused => store-resident => exact.
     assert_eq!(state.next_timer, Some(start + Duration::from_millis(40)));
     // The clock has not moved between resolution and return.
     assert_eq!(Instant::now(), state.now);
@@ -149,58 +149,63 @@ async fn quiesce_unbounded_empty_wheel_does_not_hang() {
 
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
-async fn quiesce_next_timer_is_lower_bound() {
+async fn quiesce_next_timer_exact_for_far_store_timer() {
     let start = Instant::now();
 
-    // A timer far in the future: lives in an upper wheel level, so the reported
-    // next_timer is the start of its occupied slot -- a lower bound.
+    // A timer far in the future, registered while the clock is paused: it is
+    // store-resident, so the reported next_timer is its exact deadline. (A
+    // wheel-resident timer this far out reports a slot-aligned lower bound
+    // instead; see wheel_resident_keeps_lower_bound.)
     tokio::spawn(async move {
         time::sleep_until(start + Duration::from_millis(10_000)).await;
     });
 
     let state = time::quiesce_until(start + Duration::from_millis(10)).await;
 
-    // No timer fired; the clock landed on the bound (the 10s timer's slot start
-    // is way beyond 10ms).
+    // No timer fired; the clock landed on the bound.
     assert_eq!(state.now, start + Duration::from_millis(10));
-
-    let next = state.next_timer.expect("a timer is pending");
-    // Lower bound: never later than the actual deadline...
-    assert!(
-        next <= start + Duration::from_millis(10_000),
-        "next_timer: {next:?}"
+    assert_eq!(
+        state.next_timer,
+        Some(start + Duration::from_millis(10_000))
     );
-    // ...and strictly after `now`.
-    assert!(next > state.now, "next_timer: {next:?}");
 }
 
-/// When the only pending timer lives in an upper wheel level and the quiesce bound
-/// reaches past that timer's occupied-slot start, tokio's existing auto-advance moves
-/// the clock to the slot start (a refinement hop) before the bound check can resolve
-/// the waiter. The universal invariants still hold: now <= bound, next_timer is a
-/// lower bound strictly after now, and Instant::now() == reported now.
+/// When the only pending timer is wheel-resident (registered before the clock was
+/// paused), lives in an upper wheel level, and the quiesce bound reaches past that
+/// timer's occupied-slot start, tokio's existing auto-advance moves the clock to
+/// the slot start (a refinement hop) before the bound check can resolve the
+/// waiter. The universal invariants still hold: now <= bound, next_timer is a
+/// lower bound strictly after now, and Instant::now() == reported now. (A timer
+/// registered while paused never hops: its exact deadline is visible to the
+/// resolver immediately.)
 #[cfg(feature = "test-util")]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn quiesce_until_far_timer_refinement_hops() {
     let start = Instant::now();
+    let deadline = start + Duration::from_millis(5_000);
 
-    tokio::spawn(async move {
-        time::sleep_until(start + Duration::from_millis(5_000)).await;
-    });
+    // Register while the clock is RUNNING so the timer lands in the timer wheel;
+    // registered after the pause it would be store-resident and the step below
+    // would resolve exactly, without any refinement hop.
+    let mut sleep = task::spawn(time::sleep_until(deadline));
+    assert_pending!(sleep.poll());
+
+    time::pause();
 
     let bound = start + Duration::from_millis(4_500);
     let state = time::quiesce_until(bound).await;
 
     // The 5000ms timer did not fire.
-    // `now` never exceeds the bound...
+    assert_pending!(sleep.poll());
+    // The bound reaches past the start of the timer's occupied level-2 slot
+    // (~4096ms), so the clock hopped there...
+    assert!(state.now > start, "now: {:?}", state.now);
+    // ...but `now` never exceeds the bound.
     assert!(state.now <= bound, "now: {:?}", state.now);
-    // ...and the clock may have hopped to the timer's occupied-slot start (an
-    // existing auto-advance behavior), which is at or after `start`.
-    assert!(state.now >= start);
     // next_timer is a lower bound strictly after now, never later than the deadline.
     let next = state.next_timer.expect("timer still pending");
     assert!(next > state.now);
-    assert!(next <= start + Duration::from_millis(5_000));
+    assert!(next <= deadline);
     // The clock has not moved between resolution and return.
     assert_eq!(Instant::now(), state.now);
 }
@@ -215,10 +220,8 @@ async fn quiesce_until_bound_in_past_drains_without_advancing() {
     let now = Instant::now();
     assert_eq!(now, start + Duration::from_millis(100));
 
-    // A pending timer in the future. 20ms keeps the timer's deadline (tick 120) in
-    // the same 64-tick wheel window as the current elapsed tick (100), i.e. in the
-    // wheel's bottom level, so the reported next_timer is exact rather than
-    // slot-aligned.
+    // A pending timer in the future, registered while the clock is paused: it is
+    // store-resident, so the reported next_timer is its exact deadline.
     tokio::spawn(async move {
         time::sleep(Duration::from_millis(20)).await;
     });
@@ -303,7 +306,7 @@ fn quiesce_windowed_stepping() {
     }
 
     assert_eq!(*log.lock().unwrap(), vec![1, 2, 3, 4, 5, 6]);
-    // Window reports: the clock lands on each window bound.
+    // Window reports: clock stops at the last event of each window.
     assert_eq!(reports[0].now, start + Duration::from_millis(10));
     assert_eq!(reports[1].now, start + Duration::from_millis(20));
     assert_eq!(reports[2].now, start + Duration::from_millis(30));
@@ -1214,6 +1217,228 @@ fn windowed_stepping_is_deterministic() {
     assert!(!log_1.is_empty());
     assert!(log_1.iter().any(|(_, e)| e.starts_with("echo:")));
     assert!(log_1.iter().any(|(_, e)| e.starts_with("tick:")));
+}
+
+// ===== Nanosecond precision =====
+
+/// A sub-millisecond bound fires a timer at or below it.
+/// The 300us timer (registered while paused, so exact) fires within a 500us bound,
+/// and the clock lands exactly on the bound.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn sub_ms_bound_fires_timer_within_bound() {
+    let start = Instant::now();
+    let fired = Arc::new(AtomicUsize::new(0));
+
+    {
+        let fired = fired.clone();
+        tokio::spawn(async move {
+            time::sleep_until(start + Duration::from_micros(300)).await;
+            fired.fetch_add(1, SeqCst);
+        });
+    }
+
+    let state = time::quiesce_until(start + Duration::from_micros(500)).await;
+
+    assert_eq!(fired.load(SeqCst), 1);
+    assert_eq!(state.now, start + Duration::from_micros(500));
+    assert_eq!(state.next_timer, None);
+    assert_eq!(Instant::now(), state.now);
+}
+
+/// A timer strictly beyond a sub-millisecond bound does
+/// not fire; the clock lands on the bound, and `next_timer` reports the
+/// store-resident timer's deadline exactly.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn sub_ms_bound_leaves_later_timer_pending() {
+    let start = Instant::now();
+    let fired = Arc::new(AtomicUsize::new(0));
+
+    {
+        let fired = fired.clone();
+        tokio::spawn(async move {
+            time::sleep_until(start + Duration::from_micros(700)).await;
+            fired.fetch_add(1, SeqCst);
+        });
+    }
+
+    let state = time::quiesce_until(start + Duration::from_micros(500)).await;
+
+    assert_eq!(fired.load(SeqCst), 0);
+    assert_eq!(state.now, start + Duration::from_micros(500));
+    assert_eq!(state.next_timer, Some(start + Duration::from_micros(700)));
+    assert_eq!(Instant::now(), start + Duration::from_micros(500));
+}
+
+/// The bound is inclusive at nanosecond precision -- a
+/// timer with a deadline exactly equal to the bound fires within the step.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn sub_ms_bound_inclusive_at_ns() {
+    let start = Instant::now();
+    let fired = Arc::new(AtomicUsize::new(0));
+
+    {
+        let fired = fired.clone();
+        tokio::spawn(async move {
+            time::sleep_until(start + Duration::from_micros(500)).await;
+            fired.fetch_add(1, SeqCst);
+        });
+    }
+
+    let state = time::quiesce_until(start + Duration::from_micros(500)).await;
+
+    assert_eq!(fired.load(SeqCst), 1);
+    assert_eq!(state.now, start + Duration::from_micros(500));
+    assert_eq!(state.next_timer, None);
+    assert_eq!(Instant::now(), state.now);
+}
+
+/// `next_timer` is the exact deadline of the earliest
+/// store-resident timer, not a millisecond-aligned lower bound.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn next_timer_exact_for_store_timers() {
+    let start = Instant::now();
+
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_micros(1300)).await;
+    });
+
+    let state = time::quiesce_until(start + Duration::from_millis(1)).await;
+
+    assert_eq!(state.now, start + Duration::from_millis(1));
+    assert_eq!(state.next_timer, Some(start + Duration::from_micros(1300)));
+    assert_eq!(Instant::now(), start + Duration::from_millis(1));
+}
+
+/// With a wheel-resident (registered before the pause)
+/// timer as the earliest pending, `next_timer` keeps the documented slot-aligned
+/// lower-bound contract: at or before the true deadline, strictly after `now`.
+#[cfg(feature = "test-util")]
+#[tokio::test]
+async fn wheel_resident_keeps_lower_bound() {
+    let t0 = Instant::now();
+    // 1000ms out: above the wheel's bottom level (64 one-millisecond slots), so the
+    // wheel's reported expiration is the start of the occupied level-1 slot (960ms)
+    // -- genuinely below the deadline. Far enough out that real-time scheduling
+    // stalls between `t0` and the pause below cannot push `now` past that slot
+    // start, which would break the `next > state.now` assertion.
+    let deadline = t0 + Duration::from_millis(1000);
+
+    // Register while the clock is RUNNING: the first poll places the timer in the
+    // wheel, where it stays after the pause below.
+    let mut sleep = task::spawn(time::sleep_until(deadline));
+    assert_pending!(sleep.poll());
+
+    time::pause();
+
+    let state = time::quiesce_until(t0 + Duration::from_millis(10)).await;
+
+    // The timer did not fire...
+    assert_pending!(sleep.poll());
+    // ...and next_timer is the documented lower bound: at or before the true
+    // deadline, strictly after `now`.
+    let next = state.next_timer.expect("wheel timer still pending");
+    assert!(next <= deadline, "next_timer: {next:?}");
+    assert!(next > state.now, "next_timer: {next:?}");
+}
+
+/// A windowed stepping run mixing sub-
+/// millisecond and whole-millisecond timers, executed twice in-process, produces
+/// identical `QuiescedState` reports and an identical application event log.
+///
+/// Clone of `windowed_stepping_is_deterministic` with sub-millisecond echo delays
+/// and stepping windows that are not millisecond-aligned.
+#[cfg(feature = "test-util")]
+#[test]
+fn run_twice_determinism_with_sub_ms() {
+    type Report = (Duration, Option<Duration>);
+    type EventLog = Vec<(Duration, String)>;
+
+    fn run_world() -> (Vec<Report>, EventLog) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let start = {
+            let _enter = rt.enter();
+            Instant::now()
+        };
+
+        let log: Arc<std::sync::Mutex<EventLog>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // Server: each received message schedules an echo event after a
+        // sub-millisecond delay derived from the message length.
+        {
+            let log = log.clone();
+            let _enter = rt.enter();
+            rt.spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    let delay = Duration::from_micros(150 + 175 * (msg.len() as u64 % 5));
+                    time::sleep(delay).await;
+                    let now = Instant::now();
+                    log.lock()
+                        .unwrap()
+                        .push((now - start, format!("echo:{msg}")));
+                }
+            });
+        }
+
+        // Ticker: a whole-millisecond event every 1ms for the first 10ms.
+        {
+            let log = log.clone();
+            let _enter = rt.enter();
+            rt.spawn(async move {
+                for i in 1..=10u64 {
+                    time::sleep_until(start + Duration::from_millis(i)).await;
+                    let now = Instant::now();
+                    log.lock().unwrap().push((now - start, format!("tick:{i}")));
+                }
+            });
+        }
+
+        // Controller loop: 8 windows of 1250us (not millisecond-aligned); inject
+        // one message per window.
+        let mut reports = Vec::new();
+        let mut window_end = start;
+        for w in 0..8u64 {
+            // Message lengths vary so the per-message echo delays span the whole
+            // 150..=850us range, interleaving differently with the whole-ms ticks
+            // from window to window.
+            tx.send(format!("msg-{w}-{}", "x".repeat(w as usize)))
+                .unwrap();
+
+            window_end += Duration::from_micros(1250);
+            let state = rt.block_on(time::quiesce_until(window_end));
+            reports.push((state.now - start, state.next_timer.map(|t| t - start)));
+        }
+        drop(tx);
+
+        let events = log.lock().unwrap().clone();
+        (reports, events)
+    }
+
+    let (reports_1, log_1) = run_world();
+    let (reports_2, log_2) = run_world();
+
+    assert_eq!(
+        reports_1, reports_2,
+        "QuiescedState report sequences differ between runs"
+    );
+    assert_eq!(log_1, log_2, "application event logs differ between runs");
+
+    // Sanity: the workload mixed sub-millisecond and whole-millisecond events.
+    assert!(log_1.iter().any(|(_, e)| e.starts_with("echo:")));
+    assert!(log_1.iter().any(|(_, e)| e.starts_with("tick:")));
+    assert!(log_1
+        .iter()
+        .any(|(at, _)| at.subsec_nanos() % 1_000_000 != 0));
 }
 
 // A quiesce_until step must never move the clock past its bound, even when a

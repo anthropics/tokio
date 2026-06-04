@@ -163,8 +163,8 @@ struct InnerState {
     exact: ExactStore,
 
     /// Registered quiesce waiters (test-util). Protected by the same mutex as the
-    /// wheel so the resolution decision (compare bounds against the wheel's next
-    /// expiration) is atomic.
+    /// wheel so the resolution decision (compare bounds against the earliest
+    /// pending deadline across the exact store and the wheel) is atomic.
     ///
     /// At most one entry is unresolved at any time -- registration refuses a
     /// second in-progress step -- so resolution moves the clock to a single,
@@ -185,8 +185,10 @@ cfg_test_util! {
         /// Registration id (handed back to the `Quiesce` future).
         id: u64,
 
-        /// Inclusive bound as a wheel tick (`deadline_to_tick`), or `None` for
-        /// an unbounded waiter (resolves only on an empty wheel).
+        /// Inclusive bound in nanoseconds since driver start
+        /// (`instant_to_nanos`; exact, no round-up), or `None` for an
+        /// unbounded waiter (resolves only when the exact store and the wheel
+        /// are both empty).
         bound: Option<u64>,
 
         /// Waker of the waiting task (or root future).
@@ -224,27 +226,6 @@ cfg_test_util! {
         /// The driver is shutting down; registration refused.
         Shutdown,
     }
-
-    /// True if some registered, not-yet-resolved quiesce waiter would resolve
-    /// at the runtime's current virtual-time position (its bound lies below
-    /// every pending deadline). Such a waiter is owed a resolution by the
-    /// drain-park hook before the clock moves again; an auto-advance now
-    /// would cross its bound.
-    fn has_resolvable_quiesce_waiter(lock: &InnerState) -> bool {
-        if lock.quiesce_waiters.is_empty() {
-            return false;
-        }
-
-        let next_pending = lock.wheel.next_expiration_time();
-        lock.quiesce_waiters.iter().any(|waiter| {
-            waiter.result.is_none()
-                && match (waiter.bound, next_pending) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(bound), Some(next)) => bound < next,
-                }
-        })
-    }
 }
 
 /// Where and at what deadline a timer (re)registration should land.
@@ -276,6 +257,41 @@ cfg_test_util! {
             (a, b) => a.or(b),
         };
         min_ns.map(|v| NonZeroU64::new(v).unwrap_or_else(|| NonZeroU64::new(1).unwrap()))
+    }
+
+    /// Earliest pending deadline across the exact store and the wheel, in ns.
+    /// The wheel's contribution is its tick lower bound (slot start for upper
+    /// levels), so the merged value is a sound lower bound; the store's
+    /// contribution is exact.
+    fn next_pending_ns(lock: &InnerState) -> Option<u64> {
+        match (
+            lock.exact.next_deadline(),
+            lock.wheel.next_expiration_time().map(|t| t.saturating_mul(1_000_000)),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// True if some registered, not-yet-resolved quiesce waiter would resolve
+    /// at the runtime's current virtual-time position (its bound lies below
+    /// every pending deadline). Such a waiter is owed a resolution by the
+    /// drain-park hook before the clock moves again; an auto-advance now
+    /// would cross its bound.
+    fn has_resolvable_quiesce_waiter(lock: &InnerState) -> bool {
+        if lock.quiesce_waiters.is_empty() {
+            return false;
+        }
+
+        let next_pending = next_pending_ns(lock);
+        lock.quiesce_waiters.iter().any(|waiter| {
+            waiter.result.is_none()
+                && match (waiter.bound, next_pending) {
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                    (Some(bound), Some(next)) => bound < next,
+                }
+        })
     }
 }
 
@@ -819,8 +835,8 @@ impl Handle {
         }
 
         /// Registers a quiesce waiter with an optional inclusive bound (as an
-        /// `Instant`; converted to a wheel tick with the same round-up rule `Sleep`
-        /// uses).
+        /// `Instant`; converted to exact nanoseconds since driver start, no
+        /// round-up).
         ///
         /// Refuses the registration when another step is in progress (an
         /// unresolved waiter is already registered): resolving a step moves the
@@ -845,7 +861,7 @@ impl Handle {
             bound: Option<crate::time::Instant>,
             waker: &std::task::Waker,
         ) -> QuiesceRegister {
-            let bound_tick = bound.map(|b| self.time_source.deadline_to_tick(b));
+            let bound_ns = bound.map(|b| self.time_source.instant_to_nanos(b));
 
             let mut lock = self.inner.lock();
 
@@ -861,7 +877,7 @@ impl Handle {
             lock.next_quiesce_waiter_id += 1;
             lock.quiesce_waiters.push(QuiesceWaiter {
                 id,
-                bound: bound_tick,
+                bound: bound_ns,
                 waker: waker.clone(),
                 result: None,
             });
@@ -925,13 +941,14 @@ impl Handle {
         ///
         /// At most one unresolved waiter can be registered (registration refuses a
         /// second in-progress step). It resolves when its bound lies strictly below
-        /// the wheel's next expiration — or unconditionally when the wheel is empty.
-        /// On resolution the clock is advanced to land exactly on the bound (when
-        /// the bound lies ahead of the clock): the resolution condition proves every
-        /// pending timer lies strictly beyond the bound, so the move crosses no
-        /// timer and fires nothing — the runtime is exactly as quiescent after the
-        /// move as before it. An unbounded waiter, or a bound at or before the
-        /// clock's position, leaves the clock untouched.
+        /// the earliest pending deadline across the exact store and the wheel — or
+        /// unconditionally when both are empty. On resolution the clock is advanced
+        /// to land exactly on the bound (when the bound lies ahead of the clock):
+        /// the resolution condition proves every pending deadline lies strictly
+        /// beyond the bound, so the move crosses no timer and fires nothing — the
+        /// runtime is exactly as quiescent after the move as before it. An
+        /// unbounded waiter, or a bound at or before the clock's position, leaves
+        /// the clock untouched.
         ///
         /// Returns true if the waiter was resolved (the caller must then SKIP the
         /// park).
@@ -943,8 +960,9 @@ impl Handle {
         pub(crate) fn resolve_quiesce_waiter(&self, clock: &Clock) -> bool {
             let mut lock = self.inner.lock();
 
-            let next_expiration = lock.wheel.next_expiration_time();
-            let next_timer = next_expiration.map(|tick| self.time_source.tick_to_instant(tick));
+            let next_pending_ns = next_pending_ns(&lock);
+            let wheel_next = lock.wheel.next_expiration_time();
+            let store_next = lock.exact.next_deadline();
 
             let Some(waiter) = lock
                 .quiesce_waiters
@@ -954,13 +972,15 @@ impl Handle {
                 return false;
             };
 
-            let resolves = match (waiter.bound, next_expiration) {
-                // Empty wheel: the waiter (bounded or not) resolves.
+            let resolves = match (waiter.bound, next_pending_ns) {
+                // No pending timers in either structure: the waiter (bounded or
+                // not) resolves.
                 (_, None) => true,
-                // Unbounded waiter, wheel non-empty: keep waiting.
+                // Unbounded waiter, timers pending: keep waiting.
                 (None, Some(_)) => false,
                 // Bounded waiter: resolves iff every pending timer lies strictly
-                // beyond the bound.
+                // beyond the bound (both in ns; the strict `<` is what makes the
+                // caller-facing bound inclusive).
                 (Some(bound), Some(next)) => bound < next,
             };
 
@@ -968,20 +988,31 @@ impl Handle {
                 return false;
             }
 
-            // Land the clock exactly on the bound (at the wheel's tick
-            // granularity, the same rounding the bound itself received). The
-            // clock is necessarily still paused: `resume()` panics while a
-            // waiter is registered.
-            if let Some(bound_tick) = waiter.bound {
-                let target = self.time_source.tick_to_instant(bound_tick);
-                let now = clock.now();
-                if target > now {
+            // Land the clock exactly on the bound. The clock is necessarily still
+            // paused: `resume()` panics while a waiter is registered.
+            if let Some(bound_ns) = waiter.bound {
+                let now_ns = self.time_source.instant_to_nanos(clock.now());
+                if bound_ns > now_ns {
                     clock
-                        .advance(target - now)
+                        .advance(Duration::from_nanos(bound_ns - now_ns))
                         .expect("clock must be paused while a quiesce step is registered");
                 }
             }
             let now = clock.now();
+
+            // next_timer report: exact Instant when the minimum comes from
+            // the store, tick-aligned lower bound when it comes from the
+            // wheel (unchanged contract for wheel residents). Computed from the
+            // pre-advance wheel state, which the clock move cannot change: no
+            // deadline at or before the bound exists.
+            let next_timer = match (store_next, wheel_next) {
+                (Some(s), Some(w)) if s <= w.saturating_mul(1_000_000) => {
+                    Some(self.time_source.nanos_to_instant(s))
+                }
+                (Some(s), None) => Some(self.time_source.nanos_to_instant(s)),
+                (_, Some(w)) => Some(self.time_source.tick_to_instant(w)),
+                (None, None) => None,
+            };
 
             waiter.result = Some(crate::time::QuiescedState { now, next_timer });
             let waker = waiter.waker.clone();

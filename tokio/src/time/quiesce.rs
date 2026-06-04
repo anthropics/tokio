@@ -21,12 +21,11 @@ use std::task::{self, Poll};
 pub struct QuiescedState {
     /// The virtual instant at which the runtime quiesced.
     ///
-    /// For [`quiesce_until`], the later of the call's bound (the `deadline`,
-    /// rounded up to Tokio's millisecond timer resolution) and the clock's
+    /// For [`quiesce_until`], the later of the call's `deadline` and the clock's
     /// position when the step began: resolution lands the clock exactly on the
-    /// bound, and a bound at or before the clock's position leaves the clock
-    /// unchanged. For unbounded [`quiesce`], the clock rests where the last fired
-    /// timer left it (there is no bound to land on).
+    /// deadline, and a deadline at or before the clock's position leaves the
+    /// clock unchanged. For unbounded [`quiesce`], the clock rests where the last
+    /// fired timer left it (there is no deadline to land on).
     ///
     /// Always equal to `Instant::now()` observed from within the runtime's
     /// context — inside a task, or under [`Runtime::enter`] — immediately after
@@ -40,11 +39,15 @@ pub struct QuiescedState {
     /// A lower bound on the earliest pending timer deadline strictly after `now`, or
     /// `None` if no timers remain registered with the runtime.
     ///
-    /// Exact when that deadline lies in the timer wheel's bottom level (the same
-    /// 64-millisecond aligned window as `now`); the start of the occupied wheel slot
-    /// — at or before the actual deadline — otherwise. Stepping further with
-    /// [`quiesce_until`] refines the bound: each step either fires the timer or
-    /// narrows the bound toward it.
+    /// Exact when that timer was registered while the clock was paused — the common
+    /// case, since stepping requires a paused clock. A timer registered before a
+    /// mid-run pause lives in the timer wheel instead and is tracked at the wheel's
+    /// whole-millisecond granularity (its deadline rounded up to the next tick): for
+    /// it the value is that rounded-up deadline when it lies in the wheel's bottom
+    /// level (the same 64-millisecond aligned window as `now`), and the start of the
+    /// occupied wheel slot — at or before the rounded-up deadline — otherwise.
+    /// Stepping further with [`quiesce_until`] refines a slot-aligned bound: each
+    /// step either fires the timer or narrows the bound toward it.
     pub next_timer: Option<Instant>,
 }
 
@@ -116,7 +119,7 @@ enum State {
 ///
 /// With no bound there is no deadline for the clock to land on: the clock rests
 /// wherever the last fired timer left it ([`quiesce_until`], by contrast, lands
-/// the clock on its deadline).
+/// the clock exactly on its deadline).
 ///
 /// **Important:** a workload with a recurring timer — an [`interval`], or any task
 /// that re-arms a [`sleep`] each time it fires — never empties the timer wheel, so
@@ -174,8 +177,8 @@ pub fn quiesce() -> Quiesce {
 }
 
 /// Waits until the paused runtime has run everything that can possibly happen at or
-/// before `deadline` (inclusive), lands the virtual clock on `deadline`, and
-/// reports when the next pending timer is due.
+/// before `deadline` (inclusive), lands the virtual clock exactly on `deadline`,
+/// and reports when the next pending timer is due.
 ///
 /// When the returned [`Quiesce`] future resolves, all of the following held at the
 /// moment of resolution: nothing was runnable, no [`spawn_blocking`] task spawned on
@@ -195,13 +198,14 @@ pub fn quiesce() -> Quiesce {
 ///
 /// # Where the clock ends up
 ///
-/// When the future resolves, the clock reads `deadline` — rounded up to Tokio's
-/// millisecond timer resolution, the same rounding the bound itself receives —
-/// or its prior position, for a `deadline` already at or before it. During the
-/// step the clock visits intermediate positions only to fire pending timers, and
-/// then takes one final hop to the bound. That last hop is safe by construction:
-/// the future only resolves once every pending timer lies strictly beyond the
-/// bound, so the hop crosses no timer and fires nothing.
+/// When the future resolves, the clock reads exactly `deadline` (or its prior
+/// position, for a `deadline` already at or before it). During the step the clock
+/// visits intermediate positions only to fire pending timers — each at its exact
+/// nanosecond deadline when registered while the clock was paused, at the wheel's
+/// millisecond granularity for timers registered before a mid-run [`pause`] — and
+/// then takes one final hop to `deadline`. That last hop is safe by construction:
+/// the future only resolves once every pending timer lies strictly beyond
+/// `deadline`, so the hop crosses no timer and fires nothing.
 ///
 /// [`QuiescedState::now`] reports the final position and always equals
 /// [`Instant::now()`] observed from within the runtime's context (inside a task,
@@ -210,10 +214,11 @@ pub fn quiesce() -> Quiesce {
 /// virtual clock.
 ///
 /// [`QuiescedState::next_timer`] is a lower bound on the earliest pending timer
-/// deadline strictly after `now` — exact for deadlines in the wheel's bottom
-/// level, aligned to the start of an occupied wheel slot otherwise — and is
-/// `None` exactly when no timers remain. Stepping an "empty" window (one in
-/// which nothing fires) refines a slot-aligned bound.
+/// deadline strictly after `now` — exact for timers registered while the clock
+/// was paused (the common case, since stepping requires a paused clock), exact or
+/// aligned to the start of an occupied wheel slot for timers registered before a
+/// mid-run [`pause`] — and is `None` exactly when no timers remain. Stepping an
+/// "empty" window (one in which nothing fires) refines a slot-aligned bound.
 ///
 /// # Supported calling patterns
 ///
@@ -254,7 +259,7 @@ pub fn quiesce() -> Quiesce {
 /// - the runtime has no time driver (`enable_time()`/`enable_all()` not called),
 /// - the runtime has shut down,
 /// - another quiesce step is already in progress on this runtime (resolution
-///   lands the clock on the step's bound, and the clock can only land on one;
+///   lands the clock on the step's deadline, and the clock can only land on one;
 ///   a step ends when its future resolves or is dropped), or
 /// - polled again after it has resolved.
 ///
@@ -326,6 +331,7 @@ pub fn quiesce() -> Quiesce {
 /// [`Runtime::enter`]: crate::runtime::Runtime::enter
 /// [`Handle::block_on`]: crate::runtime::Handle::block_on
 /// [`Instant::now()`]: crate::time::Instant::now
+/// [`pause`]: crate::time::pause
 /// [`resume`]: crate::time::resume
 /// [`advance`]: crate::time::advance
 pub fn quiesce_until(deadline: Instant) -> Quiesce {
