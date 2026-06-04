@@ -32,6 +32,9 @@ Extensions to the paused-clock (`tokio::time::pause()`) machinery for
 deterministic simulation and stepped testing, all gated on the `test-util`
 feature:
 
+- Timers created while the clock is paused fire at their exact nanosecond
+  deadlines (instead of the timer wheel's millisecond rounding), with
+  same-instant timers firing in registration order.
 - `tokio::time::quiesce()` / `quiesce_until(deadline)`: run a paused
   `current_thread` runtime until nothing more can happen at or below the
   given virtual-time bound, land the clock exactly on the bound, and report

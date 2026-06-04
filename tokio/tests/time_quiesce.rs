@@ -1215,3 +1215,50 @@ fn windowed_stepping_is_deterministic() {
     assert!(log_1.iter().any(|(_, e)| e.starts_with("echo:")));
     assert!(log_1.iter().any(|(_, e)| e.starts_with("tick:")));
 }
+
+// A quiesce_until step must never move the clock past its bound, even when a
+// timer registered before a mid-run pause() lives in an upper wheel level and
+// the paused clock sits at a fractional-millisecond position. The wheel hop
+// must land exactly on the tick boundary; a hop computed in whole milliseconds
+// from the fractional position overshoots it past the bound.
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_until_bound_holds_for_pre_pause_wheel_timer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Registered while the clock is running: lands in the wheel, and the
+        // 70ms deadline puts it in an upper level whose slot starts at 64ms.
+        let wheel_sleep = tokio::spawn(async move {
+            time::sleep_until(start + Duration::from_millis(70)).await;
+        });
+        // Let the spawned task run once so its timer registers.
+        tokio::task::yield_now().await;
+
+        time::pause();
+
+        // Leave the paused clock at a fractional-millisecond position.
+        time::sleep(Duration::from_micros(500)).await;
+
+        // The bound lies between the wheel slot start (64ms) and the position
+        // a whole-millisecond hop from the fractional clock position would
+        // land at (~64.5ms).
+        let bound = start + Duration::from_micros(64_400);
+        let state = time::quiesce_until(bound).await;
+
+        assert!(
+            state.now <= bound,
+            "quiesce_until resolved past its bound: now = {:?} > bound = {:?} (over by {:?})",
+            state.now,
+            bound,
+            state.now - bound,
+        );
+
+        wheel_sleep.abort();
+    });
+}

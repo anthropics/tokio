@@ -145,6 +145,12 @@ cfg_test_util! {
     /// other timer-backed primitives can cause the runtime to advance the
     /// current time when awaited.
     ///
+    /// Auto-advance moves the clock to the exact (nanosecond) deadline of the
+    /// next pending timer that was created while the clock was paused; timers
+    /// created before the clock was paused keep the timer wheel's millisecond
+    /// rounding. Timers created while the clock is paused that fire at the
+    /// same instant fire in registration order.
+    ///
     /// A paused runtime can be stepped through virtual time deterministically
     /// with [`quiesce_until`].
     ///
@@ -295,8 +301,9 @@ cfg_test_util! {
     /// # Auto-advance
     ///
     /// If the time is paused and there is no work to do, the runtime advances
-    /// time to the next timer. See [`pause`](pause#auto-advance) for more
-    /// details.
+    /// time to the next timer -- exactly to its nanosecond deadline if that
+    /// timer was created while the clock was paused. See
+    /// [`pause`](pause#auto-advance) for more details.
     ///
     /// [`sleep`]: fn@crate::time::sleep
     /// [`quiesce`]: crate::time::quiesce()
@@ -401,6 +408,14 @@ cfg_test_util! {
 
         /// Returns true if the clock is currently paused (frozen).
         pub(crate) fn is_paused(&self) -> bool {
+            // This sits on the timer registration/reset hot path, which runs in
+            // production builds whenever `test-util` is compiled in. Skip the
+            // mutex while no clock in the process has ever been paused (the
+            // same fast path `clock::now()` uses).
+            if !DID_PAUSE_CLOCK.load(Ordering::Acquire) {
+                return false;
+            }
+
             let inner = self.inner.lock();
             inner.unfrozen.is_none()
         }
@@ -437,6 +452,16 @@ cfg_test_util! {
         }
 
         pub(crate) fn now(&self) -> Instant {
+            // While no clock in the process has ever been paused, `base` and
+            // `unfrozen` still hold the same creation instant, so
+            // `base + unfrozen.elapsed()` is exactly the real current time.
+            // Skip the mutex in that case: the driver reads the clock on every
+            // park and timer-processing pass, which runs in production builds
+            // whenever `test-util` is compiled in.
+            if !DID_PAUSE_CLOCK.load(Ordering::Acquire) {
+                return Instant::from_std(std::time::Instant::now());
+            }
+
             let inner = self.inner.lock();
 
             let mut ret = inner.base;

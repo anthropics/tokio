@@ -12,7 +12,10 @@ use std::task::{self, ready, Poll};
 ///
 /// No work is performed while awaiting on the sleep future to complete. `Sleep`
 /// operates at millisecond granularity and should not be used for tasks that
-/// require high-resolution timers.
+/// require high-resolution timers. When the clock is paused via the
+/// `test-util` feature's `tokio::time::pause()`, timers created while the
+/// clock is paused fire at their exact nanosecond deadlines instead; the
+/// millisecond granularity applies to a running clock.
 ///
 /// To run something regularly on a schedule, see [`interval`].
 ///
@@ -70,9 +73,12 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 ///
 /// No work is performed while awaiting on the sleep future to complete. `Sleep`
 /// operates at millisecond granularity and should not be used for tasks that
-/// require high-resolution timers. The implementation is platform specific,
-/// and some platforms (specifically Windows) will provide timers with a
-/// larger resolution than 1 ms.
+/// require high-resolution timers. When the clock is paused via the
+/// `test-util` feature's `tokio::time::pause()`, timers created while the
+/// clock is paused fire at their exact nanosecond deadlines instead; the
+/// millisecond granularity applies to a running clock. The implementation is
+/// platform specific, and some platforms (specifically Windows) will provide
+/// timers with a larger resolution than 1 ms.
 ///
 /// To run something regularly on a schedule, see [`interval`].
 ///
