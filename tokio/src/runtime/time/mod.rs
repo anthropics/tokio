@@ -475,14 +475,14 @@ impl Driver {
                         duration = std::cmp::min(limit, duration);
                     }
 
-                    self.park_thread_timeout(rt_handle, duration);
+                    self.park_thread_timeout(rt_handle, duration, limit);
                 } else {
                     self.park.park_timeout(rt_handle, Duration::from_secs(0));
                 }
             }
             None => {
                 if let Some(duration) = limit {
-                    self.park_thread_timeout(rt_handle, duration);
+                    self.park_thread_timeout(rt_handle, duration, limit);
                 } else {
                     self.park.park(rt_handle);
                 }
@@ -494,7 +494,12 @@ impl Driver {
     }
 
     cfg_test_util! {
-        fn park_thread_timeout(&mut self, rt_handle: &driver::Handle, duration: Duration) {
+        fn park_thread_timeout(
+            &mut self,
+            rt_handle: &driver::Handle,
+            duration: Duration,
+            limit: Option<Duration>,
+        ) {
             let handle = rt_handle.time();
             let clock = rt_handle.clock();
 
@@ -546,15 +551,25 @@ impl Driver {
                 // up to 1ms late matches the lateness envelope sub-ms timers
                 // have always had. Never clamp the auto-advance branch above:
                 // that amount becomes virtual-time movement and must stay
-                // exact.
-                self.park
-                    .park_timeout(rt_handle, duration.max(Duration::from_millis(1)));
+                // exact. And never clamp past the caller's park limit: the
+                // schedulers' yield-parks pass a zero limit and must remain
+                // non-blocking driver polls.
+                let mut duration = duration.max(Duration::from_millis(1));
+                if let Some(limit) = limit {
+                    duration = std::cmp::min(limit, duration);
+                }
+                self.park.park_timeout(rt_handle, duration);
             }
         }
     }
 
     cfg_not_test_util! {
-        fn park_thread_timeout(&mut self, rt_handle: &driver::Handle, duration: Duration) {
+        fn park_thread_timeout(
+            &mut self,
+            rt_handle: &driver::Handle,
+            duration: Duration,
+            _limit: Option<Duration>,
+        ) {
             self.park.park_timeout(rt_handle, duration);
         }
     }
