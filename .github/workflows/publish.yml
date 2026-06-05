@@ -16,7 +16,26 @@ permissions:
   id-token: write
 
 jobs:
+  # Publishing must never ship an untested build: this is the only workflow
+  # that runs on pushes to the release branch (the upstream ci.yml/loom.yml
+  # triggers never match fork branches), so it carries its own gate.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup default stable
+          rustup show
+
+      - name: Test
+        working-directory: tokio
+        run: cargo test --features full,test-util,stall-detection
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     environment: publish
     steps:

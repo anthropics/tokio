@@ -1,0 +1,82 @@
+# CI for fork branches. The upstream workflows (ci.yml, loom.yml) only trigger
+# on master / tokio-*.x and are additionally gated on the tokio-rs repository
+# owner, so they never run here. This workflow covers the configurations the
+# fork actually ships: the production feature set with and without test-util,
+# the fork's added integration suites, and the loom models for the fork's
+# concurrency claims.
+name: Fork CI
+
+on:
+  push:
+    branches:
+      - anthropic-*
+  pull_request:
+    branches:
+      - anthropic-*
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (full, test-util, stall-detection)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        run: |
+          rustup default stable
+          rustup show
+      - name: Test
+        working-directory: tokio
+        run: cargo test --features full,test-util,stall-detection
+      - name: Doc tests
+        working-directory: tokio
+        run: cargo test --doc --features full,test-util,stall-detection
+
+  check-feature-combos:
+    name: check feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        run: |
+          rustup default stable
+          rustup show
+      # The production tiers: no features, the rt/time core, full without
+      # test-util, and full with test-util.
+      - name: Check
+        working-directory: tokio
+        run: |
+          set -euxo pipefail
+          cargo check --no-default-features
+          cargo check --no-default-features --features rt,time
+          cargo check --no-default-features --features full
+          cargo check --no-default-features --features full,test-util
+          cargo check --no-default-features --features full,test-util,stall-detection
+          RUSTFLAGS="--cfg tokio_unstable" cargo check --no-default-features --features full,test-util
+
+  loom:
+    name: loom (time, current_thread, blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: --cfg loom -C debug_assertions
+      LOOM_MAX_PREEMPTIONS: 2
+      LOOM_MAX_BRANCHES: 10000
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        run: |
+          rustup default stable
+          rustup show
+      - name: Loom models
+        working-directory: tokio
+        run: |
+          cargo test --lib --release --features full,test-util -- --test-threads=1 \
+            loom_current_thread loom_blocking runtime::time::tests
