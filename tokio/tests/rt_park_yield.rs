@@ -13,12 +13,13 @@ use tokio::runtime;
 // driver turns them into real sleeps, every busy runtime is throttled to one
 // maintenance park per millisecond.
 //
-// 122_000 yields cross the scheduler's maintenance interval (event_interval,
-// default 61) about 2000 times. Non-blocking parks finish the whole loop in
-// tens of milliseconds; parks that sleep >= 1ms each need >= 2 seconds. The
-// 500ms threshold separates the two by several times in both directions.
+// 61_000 yields cross the scheduler's maintenance interval (event_interval,
+// default 61) about 1000 times. Non-blocking parks finish the whole loop in
+// under ~300ms even on slow CI runners with this binary's sibling tests
+// spinning concurrently; parks that sleep >= 1ms each need >= 1 second. The
+// 500ms threshold separates the two in both directions.
 async fn spin_yields() {
-    for _ in 0..122_000 {
+    for _ in 0..61_000 {
         tokio::task::yield_now().await;
     }
 }
