@@ -28,7 +28,7 @@ async fn quiesce_until_fires_timers_within_bound() {
     assert_eq!(fired.load(SeqCst), 3);
     // The last timer fires exactly at the bound; the clock lands on it.
     assert_eq!(state.now, start + Duration::from_millis(30));
-    // The 40ms timer was registered while paused => store-resident => exact.
+    // The 40ms timer is the earliest still pending: reported exactly.
     assert_eq!(state.next_timer, Some(start + Duration::from_millis(40)));
     // The clock has not moved between resolution and return.
     assert_eq!(Instant::now(), state.now);
@@ -149,13 +149,12 @@ async fn quiesce_unbounded_empty_wheel_does_not_hang() {
 
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
-async fn quiesce_next_timer_exact_for_far_store_timer() {
+async fn quiesce_next_timer_exact_for_far_timer() {
     let start = Instant::now();
 
-    // A timer far in the future, registered while the clock is paused: it is
-    // store-resident, so the reported next_timer is its exact deadline. (A
-    // wheel-resident timer this far out reports a slot-aligned lower bound
-    // instead; see wheel_resident_keeps_lower_bound.)
+    // A timer far in the future (high in the wheel, where the slot start lies
+    // well below the deadline): the reported next_timer is still the exact
+    // deadline.
     tokio::spawn(async move {
         time::sleep_until(start + Duration::from_millis(10_000)).await;
     });
@@ -170,23 +169,17 @@ async fn quiesce_next_timer_exact_for_far_store_timer() {
     );
 }
 
-/// When the only pending timer is wheel-resident (registered before the clock was
-/// paused), lives in an upper wheel level, and the quiesce bound reaches past that
-/// timer's occupied-slot start, tokio's existing auto-advance moves the clock to
-/// the slot start (a refinement hop) before the bound check can resolve the
-/// waiter. The universal invariants still hold: now <= bound, next_timer is a
-/// lower bound strictly after now, and Instant::now() == reported now. (A timer
-/// registered while paused never hops: its exact deadline is visible to the
-/// resolver immediately.)
+/// A timer registered while the clock is *running*, then carried across a
+/// mid-run pause, behaves the same as one registered after the pause: a
+/// quiesce step that does not reach it leaves it pending and reports its
+/// exact deadline; the universal invariants (now <= bound, next_timer > now,
+/// Instant::now() == reported now) hold.
 #[cfg(feature = "test-util")]
 #[tokio::test]
-async fn quiesce_until_far_timer_refinement_hops() {
+async fn quiesce_until_pre_pause_far_timer() {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(5_000);
 
-    // Register while the clock is RUNNING so the timer lands in the timer wheel;
-    // registered after the pause it would be store-resident and the step below
-    // would resolve exactly, without any refinement hop.
     let mut sleep = task::spawn(time::sleep_until(deadline));
     assert_pending!(sleep.poll());
 
@@ -197,15 +190,14 @@ async fn quiesce_until_far_timer_refinement_hops() {
 
     // The 5000ms timer did not fire.
     assert_pending!(sleep.poll());
-    // The bound reaches past the start of the timer's occupied level-2 slot
-    // (~4096ms), so the clock hopped there...
+    // `now` never exceeds the bound (and is past `start` since some real time
+    // elapsed before the pause and the resolver landed on the bound).
     assert!(state.now > start, "now: {:?}", state.now);
-    // ...but `now` never exceeds the bound.
     assert!(state.now <= bound, "now: {:?}", state.now);
-    // next_timer is a lower bound strictly after now, never later than the deadline.
+    // next_timer is the exact deadline.
     let next = state.next_timer.expect("timer still pending");
+    assert_eq!(next, deadline);
     assert!(next > state.now);
-    assert!(next <= deadline);
     // The clock has not moved between resolution and return.
     assert_eq!(Instant::now(), state.now);
 }
@@ -220,8 +212,7 @@ async fn quiesce_until_bound_in_past_drains_without_advancing() {
     let now = Instant::now();
     assert_eq!(now, start + Duration::from_millis(100));
 
-    // A pending timer in the future, registered while the clock is paused: it is
-    // store-resident, so the reported next_timer is its exact deadline.
+    // A pending timer in the future: its exact deadline is reported.
     tokio::spawn(async move {
         time::sleep(Duration::from_millis(20)).await;
     });
@@ -1248,7 +1239,7 @@ async fn sub_ms_bound_fires_timer_within_bound() {
 
 /// A timer strictly beyond a sub-millisecond bound does
 /// not fire; the clock lands on the bound, and `next_timer` reports the
-/// store-resident timer's deadline exactly.
+/// timer's deadline exactly.
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
 async fn sub_ms_bound_leaves_later_timer_pending() {
@@ -1295,11 +1286,11 @@ async fn sub_ms_bound_inclusive_at_ns() {
     assert_eq!(Instant::now(), state.now);
 }
 
-/// `next_timer` is the exact deadline of the earliest
-/// store-resident timer, not a millisecond-aligned lower bound.
+/// `next_timer` is the exact deadline of the earliest pending timer, not
+/// a millisecond-aligned approximation.
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
-async fn next_timer_exact_for_store_timers() {
+async fn next_timer_exact_at_sub_ms() {
     let start = Instant::now();
 
     tokio::spawn(async move {
@@ -1313,22 +1304,15 @@ async fn next_timer_exact_for_store_timers() {
     assert_eq!(Instant::now(), start + Duration::from_millis(1));
 }
 
-/// With a wheel-resident (registered before the pause)
-/// timer as the earliest pending, `next_timer` keeps the documented slot-aligned
-/// lower-bound contract: at or before the true deadline, strictly after `now`.
+/// A timer registered before a mid-run pause is reported by `next_timer` at
+/// its exact deadline, the same as one registered after the pause.
 #[cfg(feature = "test-util")]
 #[tokio::test]
-async fn wheel_resident_keeps_lower_bound() {
+async fn pre_pause_timer_reports_exact_next_timer() {
     let t0 = Instant::now();
-    // 1000ms out: above the wheel's bottom level (64 one-millisecond slots), so the
-    // wheel's reported expiration is the start of the occupied level-1 slot (960ms)
-    // -- genuinely below the deadline. Far enough out that real-time scheduling
-    // stalls between `t0` and the pause below cannot push `now` past that slot
-    // start, which would break the `next > state.now` assertion.
     let deadline = t0 + Duration::from_millis(1000);
 
-    // Register while the clock is RUNNING: the first poll places the timer in the
-    // wheel, where it stays after the pause below.
+    // Register while the clock is RUNNING.
     let mut sleep = task::spawn(time::sleep_until(deadline));
     assert_pending!(sleep.poll());
 
@@ -1338,10 +1322,9 @@ async fn wheel_resident_keeps_lower_bound() {
 
     // The timer did not fire...
     assert_pending!(sleep.poll());
-    // ...and next_timer is the documented lower bound: at or before the true
-    // deadline, strictly after `now`.
-    let next = state.next_timer.expect("wheel timer still pending");
-    assert!(next <= deadline, "next_timer: {next:?}");
+    // ...and next_timer is its exact deadline.
+    let next = state.next_timer.expect("timer still pending");
+    assert_eq!(next, deadline);
     assert!(next > state.now, "next_timer: {next:?}");
 }
 
@@ -1441,11 +1424,9 @@ fn run_twice_determinism_with_sub_ms() {
         .any(|(at, _)| at.subsec_nanos() % 1_000_000 != 0));
 }
 
-// A quiesce_until step must never move the clock past its bound, even when a
-// timer registered before a mid-run pause() lives in an upper wheel level and
-// the paused clock sits at a fractional-millisecond position. The wheel hop
-// must land exactly on the tick boundary; a hop computed in whole milliseconds
-// from the fractional position overshoots it past the bound.
+// A quiesce_until step must never move the clock past its bound, even with a
+// pre-pause timer in an upper wheel level and the paused clock parked at a
+// fractional-millisecond position.
 #[cfg(feature = "test-util")]
 #[test]
 fn quiesce_until_bound_holds_for_pre_pause_wheel_timer() {
@@ -1457,8 +1438,7 @@ fn quiesce_until_bound_holds_for_pre_pause_wheel_timer() {
     rt.block_on(async {
         let start = Instant::now();
 
-        // Registered while the clock is running: lands in the wheel, and the
-        // 70ms deadline puts it in an upper level whose slot starts at 64ms.
+        // Registered while the clock is running.
         let wheel_sleep = tokio::spawn(async move {
             time::sleep_until(start + Duration::from_millis(70)).await;
         });
@@ -1470,9 +1450,6 @@ fn quiesce_until_bound_holds_for_pre_pause_wheel_timer() {
         // Leave the paused clock at a fractional-millisecond position.
         time::sleep(Duration::from_micros(500)).await;
 
-        // The bound lies between the wheel slot start (64ms) and the position
-        // a whole-millisecond hop from the fractional clock position would
-        // land at (~64.5ms).
         let bound = start + Duration::from_micros(64_400);
         let state = time::quiesce_until(bound).await;
 

@@ -18,11 +18,6 @@ pub(crate) use source::TimeSource;
 
 mod wheel;
 
-cfg_test_util! {
-    mod exact;
-    use exact::ExactStore;
-}
-
 #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
 use super::time_alt;
 
@@ -49,11 +44,10 @@ use std::{num::NonZeroU64, ptr::NonNull};
 /// or `park_timeout`. The time driver will perform no work unless `park` or
 /// `park_timeout` is called repeatedly.
 ///
-/// For a running clock, the driver has a resolution of one millisecond: any
+/// Without `test-util` the driver has a resolution of one millisecond: any
 /// unit of time that falls between milliseconds is rounded up to the next
-/// millisecond. Timers registered while the clock is paused (`test-util`
-/// feature) are instead kept in an exact, nanosecond-keyed store and fire at
-/// their exact deadlines.
+/// millisecond. With `test-util` the wheel is keyed in nanoseconds instead,
+/// so paused-clock timers fire at their exact deadlines.
 ///
 /// When an instance is dropped, any outstanding [`Sleep`][sleep] instance that has not
 /// elapsed will be notified with an error. At this point, calling `poll` on the
@@ -68,13 +62,14 @@ use std::{num::NonZeroU64, ptr::NonNull};
 /// instant, and processes each entry for that slot. When the timer reaches the
 /// end of the wheel, it starts again at the beginning.
 ///
-/// The implementation maintains six wheels arranged in a set of levels. As the
-/// levels go up, the slots of the associated wheel represent larger intervals
-/// of time. At each level, the wheel has 64 slots. Each slot covers a range of
-/// time equal to the wheel at the lower level. At level zero, each slot
-/// represents one millisecond of time.
+/// The implementation maintains a hierarchy of wheels arranged in a set of
+/// levels. As the levels go up, the slots of the associated wheel represent
+/// larger intervals of time. At each level, the wheel has 64 slots. Each slot
+/// covers a range of time equal to the wheel at the lower level. At level
+/// zero, each slot represents one tick (one millisecond, or one nanosecond
+/// under `test-util`).
 ///
-/// The wheels are:
+/// With millisecond ticks the levels are:
 ///
 /// * Level 0: 64 x 1 millisecond slots.
 /// * Level 1: 64 x 64 millisecond slots.
@@ -82,6 +77,9 @@ use std::{num::NonZeroU64, ptr::NonNull};
 /// * Level 3: 64 x ~4 minute slots.
 /// * Level 4: 64 x ~4 hour slots.
 /// * Level 5: 64 x ~12 day slots.
+///
+/// With nanosecond ticks (`test-util`) there are ten levels covering ~36
+/// years; see [`wheel::Wheel`].
 ///
 /// When the timer processes entries at level zero, it will notify all the
 /// `Sleep` instances as their deadlines have been reached. For all higher
@@ -139,32 +137,12 @@ struct InnerState {
     /// The earliest time at which we promise to wake up without unparking.
     next_wake: Option<NonZeroU64>,
 
-    /// The earliest deadline (ns since driver start) at which we promise to
-    /// wake up without being unparked, taking the minimum over the exact
-    /// store and the wheel (wheel ticks converted at 1 tick = `1e6` ns).
-    /// Used by exact-store registrations to decide whether to unpark, the
-    /// same role `next_wake` plays for wheel registrations.
-    #[cfg(feature = "test-util")]
-    next_wake_ns: Option<NonZeroU64>,
-
     /// Timer wheel.
     wheel: wheel::Wheel,
 
-    /// Exact-deadline timers registered while the clock is paused. Timers in
-    /// here fire at exact nanosecond deadlines; timers in `wheel` fire at
-    /// ms-tick granularity. The driver's next-wake decisions take the minimum
-    /// over both.
-    ///
-    /// Only the Traditional driver services this store. That is sound: a
-    /// paused clock requires the `current_thread` runtime, which always uses
-    /// the Traditional flavor; the Alternative (`time_alt`) path can never see
-    /// a paused clock.
-    #[cfg(feature = "test-util")]
-    exact: ExactStore,
-
     /// Registered quiesce waiters (test-util). Protected by the same mutex as the
     /// wheel so the resolution decision (compare bounds against the earliest
-    /// pending deadline across the exact store and the wheel) is atomic.
+    /// pending deadline) is atomic.
     ///
     /// At most one entry is unresolved at any time -- registration refuses a
     /// second in-progress step -- so resolution moves the clock to a single,
@@ -187,8 +165,7 @@ cfg_test_util! {
 
         /// Inclusive bound in nanoseconds since driver start
         /// (`instant_to_nanos`; exact, no round-up), or `None` for an
-        /// unbounded waiter (resolves only when the exact store and the wheel
-        /// are both empty).
+        /// unbounded waiter (resolves only when the wheel is empty).
         bound: Option<u64>,
 
         /// Waker of the waiting task (or root future).
@@ -228,51 +205,7 @@ cfg_test_util! {
     }
 }
 
-/// Where and at what deadline a timer (re)registration should land.
-pub(super) enum RegisterWhen {
-    /// Wheel registration at a ms tick (`deadline_to_tick`).
-    Wheel(u64),
-    /// Exact-store registration while the clock is paused.
-    #[cfg(feature = "test-util")]
-    Exact {
-        /// Deadline, in ns since driver start.
-        when_ns: u64,
-        /// The paused clock's position (ns since driver start) sampled at
-        /// route time, used for the synchronous already-elapsed fire that
-        /// mirrors the wheel's `Elapsed` insert result. The paused clock
-        /// only moves forward, so a stale sample can only under-classify a
-        /// deadline as still-future -- the entry then lands in the store and
-        /// the driver's next park-bound recomputation picks it up.
-        now_ns: u64,
-    },
-}
-
 cfg_test_util! {
-    /// Merged ns-domain wake bound: min(store first deadline, wheel tick * `1e6`),
-    /// with the same 0 -> 1 clamp convention `next_wake` uses.
-    fn merged_next_wake_ns(exact: Option<u64>, wheel_tick: Option<u64>) -> Option<NonZeroU64> {
-        let wheel_ns = wheel_tick.map(|t| t.saturating_mul(1_000_000));
-        let min_ns = match (exact, wheel_ns) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        min_ns.map(|v| NonZeroU64::new(v).unwrap_or_else(|| NonZeroU64::new(1).unwrap()))
-    }
-
-    /// Earliest pending deadline across the exact store and the wheel, in ns.
-    /// The wheel's contribution is its tick lower bound (slot start for upper
-    /// levels), so the merged value is a sound lower bound; the store's
-    /// contribution is exact.
-    fn next_pending_ns(lock: &InnerState) -> Option<u64> {
-        match (
-            lock.exact.next_deadline(),
-            lock.wheel.next_expiration_time().map(|t| t.saturating_mul(1_000_000)),
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-    }
-
     /// True if some registered, not-yet-resolved quiesce waiter would resolve
     /// at the runtime's current virtual-time position (its bound lies below
     /// every pending deadline). Such a waiter is owed a resolution by the
@@ -283,7 +216,7 @@ cfg_test_util! {
             return false;
         }
 
-        let next_pending = next_pending_ns(lock);
+        let next_pending = lock.wheel.next_when();
         lock.quiesce_waiters.iter().any(|waiter| {
             waiter.result.is_none()
                 && match (waiter.bound, next_pending) {
@@ -311,13 +244,7 @@ impl Driver {
                 state: Mutex::new(InnerState {
                     next_wake: None,
 
-                    #[cfg(feature = "test-util")]
-                    next_wake_ns: None,
-
                     wheel: wheel::Wheel::new(),
-
-                    #[cfg(feature = "test-util")]
-                    exact: ExactStore::new(),
 
                     #[cfg(feature = "test-util")]
                     quiesce_waiters: Vec::new(),
@@ -417,41 +344,19 @@ impl Driver {
         lock.next_wake = next_wake_tick
             .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
 
-        #[cfg(feature = "test-util")]
-        let next_exact = lock.exact.next_deadline();
-        #[cfg(feature = "test-util")]
-        {
-            lock.next_wake_ns = merged_next_wake_ns(next_exact, next_wake_tick);
-        }
-
         drop(lock);
 
-        // Park-duration candidates. With test-util both are computed in the
-        // nanosecond domain from one clock read: the wheel candidate's target
-        // is the tick boundary itself, and measuring the distance from the
-        // clock's exact position makes auto-advance land exactly on that
-        // boundary. A hop computed in truncated whole ticks from a
-        // fractional-millisecond position would overshoot the boundary by the
-        // fraction -- carrying a quiesce step past its bound. (Real parks
-        // never see a sub-ms wheel duration anyway: park_thread_timeout
-        // floors them to 1ms.)
+        // Park duration to the next slot boundary. With test-util ticks are
+        // nanoseconds; with a running clock park_thread_timeout floors sub-ms
+        // durations back up to 1ms.
         #[cfg(feature = "test-util")]
-        let (wheel_dur, exact_dur) = {
-            let now_ns = if next_wake_tick.is_some() || next_exact.is_some() {
-                handle.time_source.instant_to_nanos(rt_handle.clock().now())
-            } else {
-                0
-            };
-            (
-                next_wake_tick.map(|when| {
-                    Duration::from_nanos(when.saturating_mul(1_000_000).saturating_sub(now_ns))
-                }),
-                next_exact.map(|when_ns| Duration::from_nanos(when_ns.saturating_sub(now_ns))),
-            )
-        };
+        let next_dur = next_wake_tick.map(|when| {
+            let now_ns = handle.time_source.instant_to_nanos(rt_handle.clock().now());
+            Duration::from_nanos(when.saturating_sub(now_ns))
+        });
 
         #[cfg(not(feature = "test-util"))]
-        let wheel_dur = next_wake_tick.map(|when| {
+        let next_dur = next_wake_tick.map(|when| {
             let now = handle.time_source.now(rt_handle.clock());
             // Note that we effectively round up to 1ms here - this avoids
             // very short-duration microsecond-resolution sleeps that the OS
@@ -460,13 +365,6 @@ impl Driver {
                 .time_source
                 .tick_to_duration(when.saturating_sub(now))
         });
-        #[cfg(not(feature = "test-util"))]
-        let exact_dur: Option<Duration> = None;
-
-        let next_dur = match (wheel_dur, exact_dur) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
 
         match next_dur {
             Some(mut duration) => {
@@ -539,19 +437,37 @@ impl Driver {
                     // the drain-park hook resolves the waiter.
                     let lock = handle.inner.lock();
                     if !has_resolvable_quiesce_waiter(&lock) {
-                        clock.try_auto_advance(duration);
+                        // Auto-advance to the *exact* earliest deadline, not
+                        // the slot start `duration` was computed from: that
+                        // way the following `process_at_time` cascades the
+                        // entry all the way down and fires it in one pass,
+                        // instead of one park-loop iteration per wheel
+                        // level. The slot-walk this costs is confined to the
+                        // paused single-thread auto-advance path; it never
+                        // runs on a multi-thread runtime, where it would
+                        // contend the driver lock with concurrent
+                        // registrations.
+                        let target = match lock.wheel.next_when() {
+                            Some(when) => {
+                                let now_ns =
+                                    handle.time_source.instant_to_nanos(clock.now());
+                                let d =
+                                    Duration::from_nanos(when.saturating_sub(now_ns));
+                                limit.map_or(d, |l| d.min(l))
+                            }
+                            None => duration,
+                        };
+                        clock.try_auto_advance(target);
                     }
                     drop(lock);
                 }
             } else {
-                // A sub-ms timeout can only come from the exact store (wheel
-                // durations are whole ms). Under a running clock, clamp it up
-                // to 1ms: very short OS sleeps may be treated as zero-length
-                // (same rationale as the wheel's tick rounding), and firing
-                // up to 1ms late matches the lateness envelope sub-ms timers
-                // have always had. Never clamp the auto-advance branch above:
-                // that amount becomes virtual-time movement and must stay
-                // exact. And never clamp past the caller's park limit: the
+                // Under a running clock, clamp sub-ms timeouts up to 1ms:
+                // very short OS sleeps may be treated as zero-length, and
+                // firing up to 1ms late matches the documented millisecond
+                // envelope. Never clamp the auto-advance branch above: that
+                // amount becomes virtual-time movement and must stay exact.
+                // And never clamp past the caller's park limit: the
                 // schedulers' yield-parks pass a zero limit and must remain
                 // non-blocking driver polls.
                 let mut duration = duration.max(Duration::from_millis(1));
@@ -577,31 +493,16 @@ impl Driver {
 
 impl Handle {
     pub(self) fn process(&self, clock: &Clock) {
-        // Read the clock once and derive both units from the same instant, so
-        // the tick and ns positions can never disagree about "now".
         let now_instant = clock.now();
-        let now = self.time_source().instant_to_tick(now_instant);
         #[cfg(feature = "test-util")]
-        let now_ns = self.time_source().instant_to_nanos(now_instant);
+        let now = self.time_source().instant_to_nanos(now_instant);
+        #[cfg(not(feature = "test-util"))]
+        let now = self.time_source().instant_to_tick(now_instant);
 
-        self.process_at(
-            now,
-            #[cfg(feature = "test-util")]
-            now_ns,
-        );
+        self.process_at_time(now);
     }
 
-    pub(self) fn process_at_time(&self, now: u64) {
-        // Raw-tick callers (tests, shutdown) get the tick boundary as their
-        // ns position; saturating_mul keeps u64::MAX meaning "end of time".
-        self.process_at(
-            now,
-            #[cfg(feature = "test-util")]
-            now.saturating_mul(1_000_000),
-        );
-    }
-
-    fn process_at(&self, mut now: u64, #[cfg(feature = "test-util")] now_ns: u64) {
+    pub(self) fn process_at_time(&self, mut now: u64) {
         let mut waker_list = WakeList::new();
 
         let mut lock = self.inner.lock();
@@ -614,29 +515,6 @@ impl Handle {
             //
             // See <https://github.com/tokio-rs/tokio/issues/3619> for more information.
             now = lock.wheel.elapsed();
-        }
-
-        // Fire due exact-store entries first. Each structure is compared only
-        // against its own unit. Re-acquiring the lock mid-loop is sound
-        // because `pop_due` re-reads the map's first entry each iteration --
-        // registrations or cancellations during the unlock window are
-        // observed.
-        #[cfg(feature = "test-util")]
-        // SAFETY: lock held; pop_due hands back entries committed to fire and
-        // removed from every structure.
-        while let Some(entry) = unsafe { lock.exact.pop_due(now_ns) } {
-            if let Some(waker) = unsafe { entry.fire(Ok(())) } {
-                waker_list.push(waker);
-
-                if !waker_list.can_push() {
-                    // Wake a batch of wakers. To avoid deadlock, we must do this with the lock temporarily dropped.
-                    drop(lock);
-
-                    waker_list.wake_all();
-
-                    lock = self.inner.lock();
-                }
-            }
         }
 
         while let Some(entry) = lock.wheel.poll(now) {
@@ -661,12 +539,6 @@ impl Handle {
             .wheel
             .poll_at()
             .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
-
-        #[cfg(feature = "test-util")]
-        {
-            lock.next_wake_ns =
-                merged_next_wake_ns(lock.exact.next_deadline(), lock.wheel.poll_at());
-        }
 
         drop(lock);
 
@@ -704,21 +576,6 @@ impl Handle {
         wake_queue.wake_all();
     }
 
-    /// Removes the entry from whichever structure currently holds it, if any.
-    ///
-    /// SAFETY: caller holds the driver lock; the entry must be registered with
-    /// this driver or unregistered.
-    unsafe fn remove_from_structures(lock: &mut InnerState, entry: NonNull<TimerShared>) {
-        #[cfg(feature = "test-util")]
-        if unsafe { entry.as_ref().exact_key() }.is_some() {
-            unsafe { lock.exact.remove(entry) };
-            return;
-        }
-        if unsafe { entry.as_ref().might_be_registered() } {
-            unsafe { lock.wheel.remove(entry) };
-        }
-    }
-
     /// Removes a registered timer from the driver.
     ///
     /// The timer will be moved to the cancelled state. Wakers will _not_ be
@@ -734,7 +591,9 @@ impl Handle {
         unsafe {
             let mut lock = self.inner.lock();
 
-            Self::remove_from_structures(&mut lock, entry);
+            if entry.as_ref().might_be_registered() {
+                lock.wheel.remove(entry);
+            }
 
             entry.as_ref().handle().fire(Ok(()));
         }
@@ -749,7 +608,7 @@ impl Handle {
     pub(self) unsafe fn reregister(
         &self,
         unpark: &IoHandle,
-        new_when: RegisterWhen,
+        new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
         let waker = unsafe {
@@ -757,7 +616,9 @@ impl Handle {
 
             // We may have raced with a firing/deregistration, so check before
             // deregistering.
-            Self::remove_from_structures(&mut lock, entry);
+            if entry.as_ref().might_be_registered() {
+                lock.wheel.remove(entry);
+            }
 
             // Now that we have exclusive control of this entry, mint a handle to reinsert it.
             let entry = entry.as_ref().handle();
@@ -765,58 +626,26 @@ impl Handle {
             if self.is_shutdown() {
                 unsafe { entry.fire(Err(crate::time::error::Error::shutdown())) }
             } else {
-                match new_when {
-                    RegisterWhen::Wheel(tick) => {
-                        entry.set_expiration(tick);
+                entry.set_expiration(new_tick);
 
-                        // Note: We don't have to worry about racing with some other resetting
-                        // thread, because add_entry and reregister require exclusive control of
-                        // the timer entry.
-                        match unsafe { lock.wheel.insert(entry) } {
-                            Ok(when) => {
-                                if lock
-                                    .next_wake
-                                    .map(|next_wake| when < next_wake.get())
-                                    .unwrap_or(true)
-                                {
-                                    unpark.unpark();
-                                }
-
-                                None
-                            }
-                            Err((entry, crate::time::error::InsertError::Elapsed)) => unsafe {
-                                entry.fire(Ok(()))
-                            },
+                // Note: We don't have to worry about racing with some other resetting
+                // thread, because add_entry and reregister require exclusive control of
+                // the timer entry.
+                match unsafe { lock.wheel.insert(entry) } {
+                    Ok(when) => {
+                        if lock
+                            .next_wake
+                            .map(|next_wake| when < next_wake.get())
+                            .unwrap_or(true)
+                        {
+                            unpark.unpark();
                         }
-                    }
-                    #[cfg(feature = "test-util")]
-                    RegisterWhen::Exact { when_ns, now_ns } => {
-                        entry.set_expiration(when_ns);
 
-                        if when_ns <= now_ns {
-                            // Already-reached deadline: fire synchronously,
-                            // mirroring the wheel's `Elapsed` insert result, so
-                            // a first poll after registration observes Ready
-                            // exactly as it would on the wheel path.
-                            unsafe { entry.fire(Ok(())) }
-                        } else {
-                            // SAFETY: lock held; removal above guarantees the
-                            // entry is in no structure.
-                            unsafe { lock.exact.insert(entry) };
-                            // Unpark whenever the new deadline beats the
-                            // published wake bound, so a parked driver
-                            // re-evaluates its wake-up time -- the same role
-                            // the wheel arm's next_wake comparison plays.
-                            if lock
-                                .next_wake_ns
-                                .map(|nw| when_ns < nw.get())
-                                .unwrap_or(true)
-                            {
-                                unpark.unpark();
-                            }
-                            None
-                        }
+                        None
                     }
+                    Err((entry, crate::time::error::InsertError::Elapsed)) => unsafe {
+                        entry.fire(Ok(()))
+                    },
                 }
             }
 
@@ -956,8 +785,8 @@ impl Handle {
         ///
         /// At most one unresolved waiter can be registered (registration refuses a
         /// second in-progress step). It resolves when its bound lies strictly below
-        /// the earliest pending deadline across the exact store and the wheel — or
-        /// unconditionally when both are empty. On resolution the clock is advanced
+        /// the earliest pending timer deadline — or
+        /// unconditionally when the wheel is empty. On resolution the clock is advanced
         /// to land exactly on the bound (when the bound lies ahead of the clock):
         /// the resolution condition proves every pending deadline lies strictly
         /// beyond the bound, so the move crosses no timer and fires nothing — the
@@ -975,9 +804,7 @@ impl Handle {
         pub(crate) fn resolve_quiesce_waiter(&self, clock: &Clock) -> bool {
             let mut lock = self.inner.lock();
 
-            let next_pending_ns = next_pending_ns(&lock);
-            let wheel_next = lock.wheel.next_expiration_time();
-            let store_next = lock.exact.next_deadline();
+            let next_when = lock.wheel.next_when();
 
             let Some(waiter) = lock
                 .quiesce_waiters
@@ -987,9 +814,8 @@ impl Handle {
                 return false;
             };
 
-            let resolves = match (waiter.bound, next_pending_ns) {
-                // No pending timers in either structure: the waiter (bounded or
-                // not) resolves.
+            let resolves = match (waiter.bound, next_when) {
+                // No pending timers: the waiter (bounded or not) resolves.
                 (_, None) => true,
                 // Unbounded waiter, timers pending: keep waiting.
                 (None, Some(_)) => false,
@@ -1015,19 +841,10 @@ impl Handle {
             }
             let now = clock.now();
 
-            // next_timer report: exact Instant when the minimum comes from
-            // the store, tick-aligned lower bound when it comes from the
-            // wheel (unchanged contract for wheel residents). Computed from the
-            // pre-advance wheel state, which the clock move cannot change: no
-            // deadline at or before the bound exists.
-            let next_timer = match (store_next, wheel_next) {
-                (Some(s), Some(w)) if s <= w.saturating_mul(1_000_000) => {
-                    Some(self.time_source.nanos_to_instant(s))
-                }
-                (Some(s), None) => Some(self.time_source.nanos_to_instant(s)),
-                (_, Some(w)) => Some(self.time_source.tick_to_instant(w)),
-                (None, None) => None,
-            };
+            // The clock move cannot change the wheel: no deadline at or
+            // before the bound exists, so `next_when` (computed pre-advance)
+            // is still the earliest pending timer.
+            let next_timer = next_when.map(|w| self.time_source.nanos_to_instant(w));
 
             waiter.result = Some(crate::time::QuiescedState { now, next_timer });
             let waker = waiter.waker.clone();

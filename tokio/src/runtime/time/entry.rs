@@ -58,7 +58,6 @@ use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicU64;
 use crate::loom::sync::atomic::Ordering;
 
-use super::RegisterWhen;
 use crate::runtime::scheduler;
 use crate::sync::AtomicWaker;
 use crate::time::Instant;
@@ -357,35 +356,6 @@ pub(crate) struct TimerShared {
     /// complete, fired, error, etc).
     state: StateCell,
 
-    /// Nanoseconds-since-driver-start component of this entry's key in the
-    /// paused-clock exact store, valid only while `in_exact_store` is true.
-    /// Plays the same role for the exact store that `registered_when` plays
-    /// for the wheel: the (possibly stale) position the driver must use to
-    /// find the entry.
-    ///
-    /// Mutated only under the driver lock, or via `&mut TimerEntry` while the
-    /// entry is provably unregistered; relaxed ordering everywhere, exactly
-    /// like `registered_when`.
-    #[cfg(feature = "test-util")]
-    exact_registered_when: AtomicU64,
-
-    /// Sequence-number component of the exact-store key. Assigned once per
-    /// store insertion; ties between equal deadlines break by registration
-    /// order through this value. Same access discipline as
-    /// `exact_registered_when`.
-    #[cfg(feature = "test-util")]
-    exact_seq: AtomicU64,
-
-    /// Whether this entry currently lives in the exact store (as opposed to
-    /// the wheel, or neither). Set under the driver lock with relaxed
-    /// ordering; cleared by the driver with *release* ordering, pairing with
-    /// the *acquire* load in [`TimerShared::in_exact_store`] so that
-    /// `TimerEntry::reset`'s unlocked read of `false` also observes the
-    /// `mark_pending` sentinel the driver installed before clearing.
-    /// Lock-protected readers ([`TimerShared::exact_key`]) stay relaxed.
-    #[cfg(feature = "test-util")]
-    in_exact_store: crate::loom::sync::atomic::AtomicBool,
-
     _p: PhantomPinned,
 }
 
@@ -418,12 +388,6 @@ impl TimerShared {
             registered_when: AtomicU64::new(0),
             pointers: linked_list::Pointers::new(),
             state: StateCell::default(),
-            #[cfg(feature = "test-util")]
-            exact_registered_when: AtomicU64::new(0),
-            #[cfg(feature = "test-util")]
-            exact_seq: AtomicU64::new(0),
-            #[cfg(feature = "test-util")]
-            in_exact_store: crate::loom::sync::atomic::AtomicBool::new(false),
             _p: PhantomPinned,
         }
     }
@@ -488,68 +452,6 @@ impl TimerShared {
     /// definitely _not_ registered.
     pub(super) fn might_be_registered(&self) -> bool {
         self.state.might_be_registered()
-    }
-}
-
-cfg_test_util! {
-    impl TimerShared {
-        /// Returns this entry's exact-store key, or `None` if the entry is
-        /// not in the exact store.
-        ///
-        /// Reads are relaxed; callers needing a consistent answer must hold
-        /// the driver lock (or `&mut TimerEntry`), per the struct docs. For
-        /// the unlocked membership check used by `TimerEntry::reset`, see
-        /// [`TimerShared::in_exact_store`].
-        pub(in crate::runtime::time) fn exact_key(&self) -> Option<(u64, u64)> {
-            if self.in_exact_store.load(Ordering::Relaxed) {
-                Some((
-                    self.exact_registered_when.load(Ordering::Relaxed),
-                    self.exact_seq.load(Ordering::Relaxed),
-                ))
-            } else {
-                None
-            }
-        }
-
-        /// Returns whether this entry is currently in the exact store, with
-        /// acquire ordering.
-        ///
-        /// This is the one exact-store read that is meaningful *without* the
-        /// driver lock: the acquire load pairs with the release store in
-        /// [`TimerShared::clear_exact_key`], so an unlocked reader that
-        /// observes `false` also observes every state-cell write the driver
-        /// made before clearing the flag -- in particular the
-        /// `STATE_PENDING_FIRE` sentinel `mark_pending` installs on the
-        /// firing path. See `TimerEntry::reset` for why that matters.
-        pub(in crate::runtime::time) fn in_exact_store(&self) -> bool {
-            self.in_exact_store.load(Ordering::Acquire)
-        }
-
-        /// Records this entry's exact-store key.
-        ///
-        /// SAFETY: Must be called with the driver lock held (or via `&mut
-        /// TimerEntry` while the entry is in no driver structure), and only
-        /// while the entry is not already in the exact store or the wheel.
-        pub(in crate::runtime::time) unsafe fn set_exact_key(&self, when_ns: u64, seq: u64) {
-            self.exact_registered_when.store(when_ns, Ordering::Relaxed);
-            self.exact_seq.store(seq, Ordering::Relaxed);
-            self.in_exact_store.store(true, Ordering::Relaxed);
-        }
-
-        /// Clears exact-store membership.
-        ///
-        /// The release ordering pairs with the acquire load in
-        /// [`TimerShared::in_exact_store`]: on the firing path the driver
-        /// clears this flag only *after* `mark_pending` installed the
-        /// `STATE_PENDING_FIRE` sentinel in the state cell, so an unlocked
-        /// reader that observes the cleared flag is guaranteed to observe at
-        /// least that sentinel when it compare-exchanges the state cell.
-        ///
-        /// SAFETY: Must be called with the driver lock held, after the entry
-        /// has been removed from the exact store's map.
-        pub(in crate::runtime::time) unsafe fn clear_exact_key(&self) {
-            self.in_exact_store.store(false, Ordering::Release);
-        }
     }
 }
 
@@ -671,7 +573,7 @@ impl TimerEntry {
         *this.deadline = new_time;
         *this.registered = reregister;
 
-        let when = self.register_when(new_time);
+        let tick = self.register_when(new_time);
         let inner = match self.inner() {
             Some(inner) => inner,
             None => {
@@ -681,55 +583,14 @@ impl TimerEntry {
             }
         };
 
-        // The lock-free extend fast path requires the new value's unit to
-        // match the unit already in the state cell (ms ticks for wheel
-        // entries, ns for exact-store entries), so it is gated on the
-        // membership flag, read here without the driver lock. The guard is
-        // sound because:
-        //
-        // - `false` (-> Wheel fast path) is trustworthy through the
-        //   release/acquire pairing on the flag. The only clear that can race
-        //   this read is the driver's firing path (every other clear runs
-        //   under the `&mut TimerEntry` we hold), and that path installs the
-        //   `STATE_PENDING_FIRE` sentinel via `mark_pending` *before* its
-        //   release-ordered `clear_exact_key`. Observing `false` therefore
-        //   guarantees `extend_expiration`'s CAS observes at least that
-        //   sentinel, fails, and sends us to the locked re-register below.
-        //   (With relaxed ordering on the flag, the CAS could instead slot
-        //   before `mark_pending` in the state cell's modification order and
-        //   write a ms tick into a still-live nanosecond cell, firing the
-        //   entry up to a million times early.)
-        // - A stale `true` (-> skips the Wheel fast path) merely costs a full
-        //   re-register: conservative.
-        // - The Exact arm does not rely on the flag at all: even with the
-        //   driver concurrently firing the entry, `extend_expiration` either
-        //   orders after `mark_pending` (sentinel rejection -> locked
-        //   re-register) or before it, in which case `mark_pending` observes
-        //   the extended ns deadline, firing only if it is already due and
-        //   reinserting the entry at it otherwise. Units stay ns/ns either
-        //   way.
-        #[cfg(feature = "test-util")]
-        let fast_path_value = match &when {
-            RegisterWhen::Wheel(tick) if !inner.in_exact_store() => Some(*tick),
-            RegisterWhen::Exact { when_ns, .. } if inner.in_exact_store() => Some(*when_ns),
-            _ => None,
-        };
-        #[cfg(not(feature = "test-util"))]
-        let fast_path_value = {
-            let RegisterWhen::Wheel(tick) = &when;
-            Some(*tick)
-        };
-
-        if let Some(v) = fast_path_value {
-            if inner.extend_expiration(v).is_ok() {
-                return;
-            }
+        if inner.extend_expiration(tick).is_ok() {
+            return;
         }
 
         if reregister {
             unsafe {
                 self.driver()
-                    .reregister(&self.driver.driver().io, when, inner.into());
+                    .reregister(&self.driver.driver().io, tick, inner.into());
             }
         }
     }
@@ -767,30 +628,19 @@ impl TimerEntry {
 
 cfg_test_util! {
     impl TimerEntry {
-        fn is_clock_paused(&self) -> bool {
-            self.driver.driver().clock().is_paused()
-        }
-
-        /// Route for a (re)registration at `deadline`: paused -> exact ns,
-        /// running -> ms tick.
-        fn register_when(&self, deadline: Instant) -> RegisterWhen {
-            if self.is_clock_paused() {
-                let time_source = self.driver().time_source();
-                RegisterWhen::Exact {
-                    when_ns: time_source.instant_to_nanos(deadline),
-                    now_ns: time_source.instant_to_nanos(self.driver.driver().clock().now()),
-                }
-            } else {
-                RegisterWhen::Wheel(self.driver().time_source().deadline_to_tick(deadline))
-            }
+        /// Wheel tick for `deadline`. Under `test-util` ticks are
+        /// nanoseconds since driver start, so paused-clock timers fire at
+        /// exact deadlines.
+        fn register_when(&self, deadline: Instant) -> u64 {
+            self.driver().time_source().instant_to_nanos(deadline)
         }
     }
 }
 
 cfg_not_test_util! {
     impl TimerEntry {
-        fn register_when(&self, deadline: Instant) -> RegisterWhen {
-            RegisterWhen::Wheel(self.driver().time_source().deadline_to_tick(deadline))
+        fn register_when(&self, deadline: Instant) -> u64 {
+            self.driver().time_source().deadline_to_tick(deadline)
         }
     }
 }
@@ -861,24 +711,3 @@ impl TimerHandle {
     }
 }
 
-#[cfg(test)]
-impl TimerHandle {
-    /// Test-only identity check: does this handle point at `other`?
-    pub(super) fn ptr_eq(&self, other: NonNull<TimerShared>) -> bool {
-        self.inner == other
-    }
-}
-
-cfg_test_util! {
-    impl TimerHandle {
-        /// SAFETY: caller must hold the driver lock and the handle must be valid.
-        pub(super) unsafe fn set_exact_key(&self, when_ns: u64, seq: u64) {
-            unsafe { self.inner.as_ref().set_exact_key(when_ns, seq) }
-        }
-
-        /// SAFETY: caller must hold the driver lock and the handle must be valid.
-        pub(super) unsafe fn clear_exact_key(&self) {
-            unsafe { self.inner.as_ref().clear_exact_key() }
-        }
-    }
-}

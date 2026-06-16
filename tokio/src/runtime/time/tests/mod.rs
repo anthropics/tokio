@@ -40,18 +40,21 @@ fn rt(start_paused: bool) -> crate::runtime::Runtime {
         .unwrap()
 }
 
+// Loom models below anchor deadlines on the driver's start_time (not
+// clock.now()): the wheel is keyed in nanoseconds, so a deadline taken from a
+// real-clock read varies by a few hundred ns between loom executions, putting
+// the entry in different wheel slots and making the model nondeterministic.
+
 #[test]
 fn single_timer() {
     model(|| {
         let rt = rt(false);
         let handle = rt.handle();
+        let start = handle.inner.driver().time().time_source().start_time();
 
         let handle_ = handle.clone();
         let jh = thread::spawn(move || {
-            let entry = TimerEntry::new(
-                handle_.inner.clone(),
-                handle_.inner.driver().clock().now() + Duration::from_secs(1),
-            );
+            let entry = TimerEntry::new(handle_.inner.clone(), start + Duration::from_secs(1));
             pin!(entry);
 
             block_on(std::future::poll_fn(|cx| entry.as_mut().poll_elapsed(cx))).unwrap();
@@ -59,11 +62,8 @@ fn single_timer() {
 
         thread::yield_now();
 
-        let time = handle.inner.driver().time();
-        let clock = handle.inner.driver().clock();
-
         // advance 2s
-        time.process_at_time(time.time_source().now(clock) + 2_000_000_000);
+        handle.inner.driver().time().process_at_time(2_000_000_000);
 
         jh.join().unwrap();
     })
@@ -74,13 +74,11 @@ fn drop_timer() {
     model(|| {
         let rt = rt(false);
         let handle = rt.handle();
+        let start = handle.inner.driver().time().time_source().start_time();
 
         let handle_ = handle.clone();
         let jh = thread::spawn(move || {
-            let entry = TimerEntry::new(
-                handle_.inner.clone(),
-                handle_.inner.driver().clock().now() + Duration::from_secs(1),
-            );
+            let entry = TimerEntry::new(handle_.inner.clone(), start + Duration::from_secs(1));
             pin!(entry);
 
             let _ = entry
@@ -93,11 +91,8 @@ fn drop_timer() {
 
         thread::yield_now();
 
-        let time = handle.inner.driver().time();
-        let clock = handle.inner.driver().clock();
-
         // advance 2s in the future.
-        time.process_at_time(time.time_source().now(clock) + 2_000_000_000);
+        handle.inner.driver().time().process_at_time(2_000_000_000);
 
         jh.join().unwrap();
     })
@@ -108,13 +103,11 @@ fn change_waker() {
     model(|| {
         let rt = rt(false);
         let handle = rt.handle();
+        let start = handle.inner.driver().time().time_source().start_time();
 
         let handle_ = handle.clone();
         let jh = thread::spawn(move || {
-            let entry = TimerEntry::new(
-                handle_.inner.clone(),
-                handle_.inner.driver().clock().now() + Duration::from_secs(1),
-            );
+            let entry = TimerEntry::new(handle_.inner.clone(), start + Duration::from_secs(1));
             pin!(entry);
 
             let _ = entry
@@ -126,11 +119,8 @@ fn change_waker() {
 
         thread::yield_now();
 
-        let time = handle.inner.driver().time();
-        let clock = handle.inner.driver().clock();
-
         // advance 2s
-        time.process_at_time(time.time_source().now(clock) + 2_000_000_000);
+        handle.inner.driver().time().process_at_time(2_000_000_000);
 
         jh.join().unwrap();
     })
@@ -146,7 +136,7 @@ fn reset_future() {
 
         let handle_ = handle.clone();
         let finished_early_ = finished_early.clone();
-        let start = handle.inner.driver().clock().now();
+        let start = handle.inner.driver().time().time_source().start_time();
 
         let jh = thread::spawn(move || {
             let entry = TimerEntry::new(handle_.inner.clone(), start + Duration::from_secs(1));
@@ -168,19 +158,12 @@ fn reset_future() {
 
         let handle = handle.inner.driver().time();
 
-        handle.process_at_time(
-            handle
-                .time_source()
-                .instant_to_tick(start + Duration::from_millis(1500)),
-        );
+        // start == driver start, so 1500/2500 ms map to those exact tick values.
+        handle.process_at_time(1_500_000_000);
 
         assert!(!finished_early.load(Ordering::Relaxed));
 
-        handle.process_at_time(
-            handle
-                .time_source()
-                .instant_to_tick(start + Duration::from_millis(2500)),
-        );
+        handle.process_at_time(2_500_000_000);
 
         jh.join().unwrap();
 
@@ -223,17 +206,12 @@ fn poll_process_levels() {
         entries.push(entry);
     }
 
-    // This test exists to walk the wheel's levels, so the entries must be
-    // wheel-resident: a paused runtime would route them to the exact store,
-    // where the tick walk below could not exercise level cascades.
-    {
-        let lock = handle.inner.driver().time().inner.lock();
-        assert_eq!(lock.exact.len(), 0);
-        assert!(lock.wheel.next_expiration_time().is_some());
-    }
-
     for t in 1..normal_or_miri(1024, 64) {
-        handle.inner.driver().time().process_at_time(t as u64);
+        handle
+            .inner
+            .driver()
+            .time()
+            .process_at_time(t as u64 * 1_000_000);
 
         for (deadline, future) in entries.iter_mut().enumerate() {
             let mut context = Context::from_waker(noop_waker_ref());
@@ -254,28 +232,19 @@ fn poll_process_levels_targeted() {
     let rt = rt(false);
     let handle = rt.handle();
 
-    // As in `poll_process_levels`: an unpaused runtime and a start-time-based
-    // deadline keep this entry wheel-resident at exactly tick 193.
+    // A start-time-based deadline keeps this entry at exactly tick 193e6 ns.
     let start = handle.inner.driver().time().time_source().start_time();
 
     let e1 = TimerEntry::new(handle.inner.clone(), start + Duration::from_millis(193));
     pin!(e1);
-    // Registration happens on first poll; poll now so the wheel-residency
-    // assertion below observes the registered entry.
     assert!(e1.as_mut().poll_elapsed(&mut context).is_pending());
 
     let handle = handle.inner.driver().time();
 
-    {
-        let lock = handle.inner.lock();
-        assert_eq!(lock.exact.len(), 0);
-        assert!(lock.wheel.next_expiration_time().is_some());
-    }
-
-    handle.process_at_time(62);
+    handle.process_at_time(62 * 1_000_000);
     assert!(e1.as_mut().poll_elapsed(&mut context).is_pending());
-    handle.process_at_time(192);
-    handle.process_at_time(192);
+    handle.process_at_time(192 * 1_000_000);
+    handle.process_at_time(192 * 1_000_000);
 }
 
 #[test]
@@ -321,7 +290,7 @@ fn instant_to_nanos_exact_and_saturating() {
 
 #[test]
 #[cfg(not(loom))]
-fn paused_registration_lands_in_exact_store() {
+fn paused_registration_lands_in_wheel_at_exact_ns() {
     let rt = rt(true);
     let handle = rt.handle();
 
@@ -337,75 +306,15 @@ fn paused_registration_lands_in_exact_store() {
 
     let time = handle.inner.driver().time();
     let lock = time.inner.lock();
-    assert_eq!(lock.exact.len(), 1);
-    assert_eq!(lock.wheel.next_expiration_time(), None);
+    assert_eq!(lock.wheel.next_when(), Some(100_000));
 }
 
 #[test]
 #[cfg(not(loom))]
-fn unpaused_registration_lands_in_wheel() {
-    let rt = rt(false);
-    let handle = rt.handle();
-
-    let entry = TimerEntry::new(
-        handle.inner.clone(),
-        handle.inner.driver().clock().now() + Duration::from_secs(1),
-    );
-    pin!(entry);
-    // Registration happens on first poll.
-    let _ = entry
-        .as_mut()
-        .poll_elapsed(&mut Context::from_waker(futures::task::noop_waker_ref()));
-
-    let time = handle.inner.driver().time();
-    let lock = time.inner.lock();
-    assert_eq!(lock.exact.len(), 0);
-    assert!(lock.wheel.next_expiration_time().is_some());
-}
-
-#[test]
-#[cfg(not(loom))]
-fn pre_pause_timer_stays_in_wheel_after_pause() {
-    // Routing half of the pre-pause contract: register on a running
-    // (pausable) clock, then pause; the wheel-resident entry stays put, and a
-    // NEW registration goes to the store.
-    let rt = rt(false);
-    let handle = rt.handle();
-    let clock = handle.inner.driver().clock();
-
-    let entry_a = TimerEntry::new(handle.inner.clone(), clock.now() + Duration::from_secs(1));
-    pin!(entry_a);
-    // Register (first poll) while the clock is still running.
-    let _ = entry_a
-        .as_mut()
-        .poll_elapsed(&mut Context::from_waker(futures::task::noop_waker_ref()));
-
-    {
-        let _enter = rt.enter();
-        crate::time::pause();
-    }
-
-    let entry_b = TimerEntry::new(
-        handle.inner.clone(),
-        clock.now() + Duration::from_micros(100),
-    );
-    pin!(entry_b);
-    let _ = entry_b
-        .as_mut()
-        .poll_elapsed(&mut Context::from_waker(futures::task::noop_waker_ref()));
-
-    let time = handle.inner.driver().time();
-    let lock = time.inner.lock();
-    assert_eq!(lock.exact.len(), 1);
-    assert!(lock.wheel.next_expiration_time().is_some());
-}
-
-#[test]
-#[cfg(not(loom))]
-fn exact_store_entry_fires_via_process_at_time() {
+fn paused_sub_ms_entry_fires_at_end_of_time() {
     // Register a 100us timer on a paused runtime, then drive the driver the
     // way shutdown does: process_at_time(u64::MAX). The entry must fire
-    // Ok(()) -- same semantics as wheel entries at shutdown.
+    // Ok(()).
     let rt = rt(true);
     let handle = rt.handle();
 
@@ -440,10 +349,9 @@ fn paused_registration_after_shutdown_panics() {
         crate::time::Instant::now() + Duration::from_micros(100),
     );
     pin!(entry);
-    // Registration on a shut-down driver is rejected inside reregister,
-    // before route dispatch (fires Err(shutdown) into the state cell) --
-    // identical for both routes. The user-visible rejection is the
-    // poll_elapsed assert, which panics.
+    // Registration on a shut-down driver is rejected inside reregister
+    // (fires Err(shutdown) into the state cell). The user-visible rejection
+    // is the poll_elapsed assert, which panics.
     entry
         .as_mut()
         .reset(crate::time::Instant::now() + Duration::from_micros(100), true);
@@ -454,7 +362,7 @@ fn paused_registration_after_shutdown_panics() {
 
 #[test]
 #[cfg(not(loom))]
-fn dropping_paused_timer_clears_exact_store() {
+fn dropping_paused_timer_clears_wheel() {
     let rt = rt(true);
     let handle = rt.handle();
 
@@ -467,11 +375,22 @@ fn dropping_paused_timer_clears_exact_store() {
         let _ = entry
             .as_mut()
             .poll_elapsed(&mut Context::from_waker(futures::task::noop_waker_ref()));
-        assert_eq!(handle.inner.driver().time().inner.lock().exact.len(), 1);
+        assert!(handle
+            .inner
+            .driver()
+            .time()
+            .inner
+            .lock()
+            .wheel
+            .next_when()
+            .is_some());
         // entry dropped here -> PinnedDrop -> cancel -> clear_entry
     }
 
-    assert_eq!(handle.inner.driver().time().inner.lock().exact.len(), 0);
+    assert_eq!(
+        handle.inner.driver().time().inner.lock().wheel.next_when(),
+        None
+    );
 }
 
 #[test]
@@ -517,12 +436,11 @@ fn paused_timer_reset_vs_fire() {
                     .as_mut()
                     .poll_elapsed(&mut Context::from_waker(futures::task::noop_waker_ref()));
                 // Lock-free extend (later deadline) racing the driver firing
-                // at u64::MAX below: either the extend wins (entry reinserted
-                // at its true deadline, then fired by a later pop) or the
-                // fire wins (reset's extend fails -> full re-register on a
-                // fired entry re-arms it). Both must be memory-safe and
-                // deadlock-free; the entry must end fired or pending, never
-                // lost.
+                // at u64::MAX below: either the extend wins (entry stays
+                // registered, then fired by a later poll) or the fire wins
+                // (reset's extend fails -> full re-register on a fired entry
+                // re-arms it). Both must be memory-safe and deadlock-free;
+                // the entry must end fired or pending, never lost.
                 entry
                     .as_mut()
                     .reset(start + Duration::from_micros(800), true);
@@ -544,20 +462,25 @@ fn paused_timer_reset_vs_fire() {
 
 #[test]
 #[cfg(not(loom))]
-fn timer_shared_exact_key_roundtrip() {
-    use crate::runtime::time::TimerShared;
+fn wheel_next_when_is_exact_for_upper_levels() {
+    let rt = rt(true);
+    let handle = rt.handle();
+    let clock = handle.inner.driver().clock();
+    let time = handle.inner.driver().time();
+    let start = time.time_source().start_time();
+    assert_eq!(start, clock.now());
 
-    let shared = Box::pin(TimerShared::new());
+    // 10s lands at level 5 of the ns-tick wheel; the slot start (which
+    // `next_expiration_time` returns) is several hundred ms below the
+    // deadline.
+    let entry = TimerEntry::new(handle.inner.clone(), start + Duration::from_secs(10));
+    pin!(entry);
+    let _ = entry
+        .as_mut()
+        .poll_elapsed(&mut Context::from_waker(futures::task::noop_waker_ref()));
 
-    assert_eq!(shared.exact_key(), None);
-
-    // SAFETY: single-threaded test; the entry is in no driver structure, so
-    // the "driver lock or &mut TimerEntry" access rule is trivially upheld.
-    unsafe {
-        shared.set_exact_key(1_234_567, 42);
-        assert_eq!(shared.exact_key(), Some((1_234_567, 42)));
-
-        shared.clear_exact_key();
-        assert_eq!(shared.exact_key(), None);
-    }
+    let lock = time.inner.lock();
+    let slot_start = lock.wheel.next_expiration_time().unwrap();
+    assert!(slot_start < 10_000_000_000);
+    assert_eq!(lock.wheel.next_when(), Some(10_000_000_000));
 }

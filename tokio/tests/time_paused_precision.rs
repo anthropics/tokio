@@ -30,9 +30,8 @@ async fn sleep_until_now_elapses_zero() {
     sleep_until(Instant::now()).await;
     assert_eq!(start.elapsed(), Duration::ZERO);
 
-    // (b) Mid-tick: park the paused clock between ms ticks first. The wheel
-    // rounds a due-now deadline up to the next tick here; the exact store
-    // must complete it with zero elapsed virtual time.
+    // (b) Mid-tick: park the paused clock between ms ticks first. A
+    // due-now sleep must still complete with zero elapsed virtual time.
     time::advance(Duration::from_micros(300)).await;
     let start = Instant::now();
     sleep_until(Instant::now()).await;
@@ -186,8 +185,8 @@ async fn non_aligned_deadline_exact() {
 #[tokio::test(start_paused = true)]
 async fn reset_later_and_earlier_exact() {
     // Reset to a LATER sub-ms deadline after the timer has registered: the
-    // lock-free extend fast path, with the store lazily reinserting the entry
-    // at its true deadline.
+    // lock-free extend fast path, with the wheel lazily reinserting the entry
+    // at its true deadline when its slot is next processed.
     let start = Instant::now();
     let s = sleep(Duration::from_micros(300));
     tokio::pin!(s);
@@ -216,10 +215,9 @@ async fn reset_later_and_earlier_exact() {
 }
 
 #[tokio::test]
-async fn pre_pause_timer_keeps_ms_rounding() {
-    // Boundary of the guarantee: a timer registered BEFORE a mid-run pause()
-    // stays wheel-resident and keeps today's ms-rounded firing; a timer
-    // registered after the pause is exact.
+async fn pre_pause_timer_fires_after_pause() {
+    // A timer registered BEFORE a mid-run pause() fires under auto-advance
+    // afterwards, never early, with the same lateness envelope as today.
     let t0 = Instant::now();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
 
@@ -242,8 +240,7 @@ async fn pre_pause_timer_keeps_ms_rounding() {
     time::pause();
 
     // The real clock ran briefly before the pause, so exact equality is not
-    // assertable; assert the today-envelope (deadline reached, ms-rounded
-    // completion).
+    // assertable; assert the envelope (deadline reached, never early).
     let elapsed = jh.await.unwrap();
     assert!(elapsed >= Duration::from_micros(100), "{elapsed:?}");
     assert!(elapsed <= Duration::from_millis(2), "{elapsed:?}");
@@ -280,15 +277,15 @@ async fn advance_then_sub_ms_sleep_no_overshoot() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn advance_past_store_deadline_fires() {
+async fn advance_past_sub_ms_deadline_fires() {
     let jh = tokio::spawn(async {
         sleep(Duration::from_micros(300)).await;
     });
-    // Let the spawned task run once so its timer registers in the store.
+    // Let the spawned task run once so its timer registers.
     tokio::task::yield_now().await;
 
-    // An explicit advance() past the store deadline fires it on the next
-    // runtime touch, without moving the clock again.
+    // An explicit advance() past the deadline fires it on the next runtime
+    // touch, without moving the clock again.
     time::advance(Duration::from_millis(1)).await;
     let now = Instant::now();
 
@@ -327,7 +324,8 @@ async fn inhibits_still_hold_with_sub_ms_pending() {
 #[tokio::test(start_paused = true)]
 async fn same_deadline_fires_in_registration_order() {
     // Completion order observed through the channel reflects waker order,
-    // which the store's pop order determines on the current_thread runtime.
+    // which the wheel's level-0 slot FIFO determines on the current_thread
+    // runtime.
     let start = Instant::now();
     let deadline = start + Duration::from_micros(400);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -353,17 +351,17 @@ async fn same_deadline_fires_in_registration_order() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn resume_with_pending_store_timer() {
-    // A timer registered in the exact store while the clock is paused must
-    // survive a mid-flight resume(): the now-running clock picks it up and
-    // fires it at or after its deadline, never before.
+async fn resume_with_pending_paused_timer() {
+    // A timer registered while the clock is paused must survive a
+    // mid-flight resume(): the now-running clock picks it up and fires it at
+    // or after its deadline, never before.
     let start = Instant::now();
     let jh = tokio::spawn(async move {
         sleep(Duration::from_micros(300)).await;
         start.elapsed()
     });
-    // Run the spawned task to its first poll so the timer registers in the
-    // store while the clock is still paused.
+    // Run the spawned task to its first poll so the timer registers while
+    // the clock is still paused.
     tokio::task::yield_now().await;
 
     time::resume();

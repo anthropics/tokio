@@ -36,18 +36,17 @@ pub struct QuiescedState {
     /// [`quiesce`]: crate::time::quiesce()
     pub now: Instant,
 
-    /// A lower bound on the earliest pending timer deadline strictly after `now`, or
-    /// `None` if no timers remain registered with the runtime.
+    /// The earliest pending timer deadline strictly after `now`, or `None` if no
+    /// timers remain registered with the runtime.
     ///
-    /// Exact when that timer was registered while the clock was paused — the common
-    /// case, since stepping requires a paused clock. A timer registered before a
-    /// mid-run pause lives in the timer wheel instead and is tracked at the wheel's
-    /// whole-millisecond granularity (its deadline rounded up to the next tick): for
-    /// it the value is that rounded-up deadline when it lies in the wheel's bottom
-    /// level (the same 64-millisecond aligned window as `now`), and the start of the
-    /// occupied wheel slot — at or before the rounded-up deadline — otherwise.
-    /// Stepping further with [`quiesce_until`] refines a slot-aligned bound: each
-    /// step either fires the timer or narrows the bound toward it.
+    /// Reported at nanosecond precision. A timer that has been extended via
+    /// [`Sleep::reset`] to a later deadline, and whose wheel slot the driver has
+    /// not yet revisited, is reported at its pre-extend (registered) deadline — a
+    /// lower bound on its actual fire time; the next step that reaches that slot
+    /// re-keys it. Treat the value as a snapshot taken at resolution time: the
+    /// reported timer may be cancelled or extended afterward.
+    ///
+    /// [`Sleep::reset`]: crate::time::Sleep::reset
     pub next_timer: Option<Instant>,
 }
 
@@ -201,11 +200,9 @@ pub fn quiesce() -> Quiesce {
 /// When the future resolves, the clock reads exactly `deadline` (or its prior
 /// position, for a `deadline` already at or before it). During the step the clock
 /// visits intermediate positions only to fire pending timers — each at its exact
-/// nanosecond deadline when registered while the clock was paused, at the wheel's
-/// millisecond granularity for timers registered before a mid-run [`pause`] — and
-/// then takes one final hop to `deadline`. That last hop is safe by construction:
-/// the future only resolves once every pending timer lies strictly beyond
-/// `deadline`, so the hop crosses no timer and fires nothing.
+/// nanosecond deadline — and then takes one final hop to `deadline`. That last
+/// hop is safe by construction: the future only resolves once every pending timer
+/// lies strictly beyond `deadline`, so the hop crosses no timer and fires nothing.
 ///
 /// [`QuiescedState::now`] reports the final position and always equals
 /// [`Instant::now()`] observed from within the runtime's context (inside a task,
@@ -213,12 +210,9 @@ pub fn quiesce() -> Quiesce {
 /// context, `Instant::now()` reads the real system clock instead of the paused
 /// virtual clock.
 ///
-/// [`QuiescedState::next_timer`] is a lower bound on the earliest pending timer
-/// deadline strictly after `now` — exact for timers registered while the clock
-/// was paused (the common case, since stepping requires a paused clock), exact or
-/// aligned to the start of an occupied wheel slot for timers registered before a
-/// mid-run [`pause`] — and is `None` exactly when no timers remain. Stepping an
-/// "empty" window (one in which nothing fires) refines a slot-aligned bound.
+/// [`QuiescedState::next_timer`] is the earliest pending timer's registered
+/// deadline strictly after `now` (see the field's doc for the one inexact
+/// case), and is `None` exactly when no timers remain.
 ///
 /// # Supported calling patterns
 ///
@@ -331,7 +325,6 @@ pub fn quiesce() -> Quiesce {
 /// [`Runtime::enter`]: crate::runtime::Runtime::enter
 /// [`Handle::block_on`]: crate::runtime::Handle::block_on
 /// [`Instant::now()`]: crate::time::Instant::now
-/// [`pause`]: crate::time::pause
 /// [`resume`]: crate::time::resume
 /// [`advance`]: crate::time::advance
 pub fn quiesce_until(deadline: Instant) -> Quiesce {

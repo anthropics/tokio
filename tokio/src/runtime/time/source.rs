@@ -14,6 +14,7 @@ impl TimeSource {
         }
     }
 
+    #[cfg_attr(feature = "test-util", allow(dead_code))]
     pub(crate) fn deadline_to_tick(&self, t: Instant) -> u64 {
         // Round up to the end of a ms
         self.instant_to_tick(t + Duration::from_nanos(999_999))
@@ -29,27 +30,16 @@ impl TimeSource {
         ms.min(MAX_SAFE_MILLIS_DURATION)
     }
 
-    // With test-util the driver's park path works in the ns domain; these two
-    // remain for the not(test-util) park path, the alternative driver, and
-    // tests, which not every cfg combination compiles.
+    // With test-util the traditional driver works in the ns domain; the ms
+    // tick conversions remain for the not(test-util) build, the alternative
+    // driver, and tests, which not every cfg combination compiles.
     #[cfg_attr(feature = "test-util", allow(dead_code))]
     pub(crate) fn tick_to_duration(&self, t: u64) -> Duration {
         Duration::from_millis(t)
     }
 
-    /// Converts a wheel tick back to an `Instant`.
-    ///
-    /// Saturates to `Instant::far_future()` if the tick does not fit (mirrors how
-    /// `instant_to_tick` saturates at `MAX_SAFE_MILLIS_DURATION`).
-    #[cfg(feature = "test-util")]
-    pub(crate) fn tick_to_instant(&self, tick: u64) -> Instant {
-        self.start_time
-            .checked_add(Duration::from_millis(tick))
-            .unwrap_or_else(Instant::far_future)
-    }
-
     /// Converts an `Instant` to whole nanoseconds since the driver's start
-    /// time, used to key paused-clock timers in the exact store.
+    /// time. Under `test-util` this is the wheel's tick unit.
     ///
     /// Saturates to `MAX_SAFE_MILLIS_DURATION` — the largest value below the
     /// timer state sentinels; the cap is a raw `u64` shared by both tick

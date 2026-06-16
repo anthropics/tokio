@@ -20,32 +20,39 @@ use super::EntryList;
 /// [`Driver`]: crate::runtime::time::Driver
 #[derive(Debug)]
 pub(crate) struct Wheel {
-    /// The number of milliseconds elapsed since the wheel started.
+    /// The number of ticks elapsed since the wheel started. Ticks are
+    /// milliseconds without `test-util`, nanoseconds with it.
     elapsed: u64,
 
     /// Timer wheel.
     ///
-    /// Levels:
-    ///
-    /// * 1 ms slots / 64 ms range
-    /// * 64 ms slots / ~ 4 sec range
-    /// * ~ 4 sec slots / ~ 4 min range
-    /// * ~ 4 min slots / ~ 4 hr range
-    /// * ~ 4 hr slots / ~ 12 day range
-    /// * ~ 12 day slots / ~ 2 yr range
+    /// Each level's slots are 64x wider than the one below; level 0 slots
+    /// are 1 tick. With ms ticks (6 levels) the table is 1ms / 64ms / ~4s /
+    /// ~4m / ~4h / ~12d; with ns ticks (10 levels) it is 1ns / 64ns / ~4us /
+    /// ~262us / ~16ms / ~1s / ~68s / ~73m / ~78h / ~208d.
     levels: Box<[Level; NUM_LEVELS]>,
 
     /// Entries queued for firing
     pending: EntryList,
 }
 
-/// Number of levels. Each level has 64 slots. By using 6 levels with 64 slots
-/// each, the timer is able to track time up to 2 years into the future with a
-/// precision of 1 millisecond.
+/// Bits per level: each level's 64 slots cover 6 bits of the tick value.
+const SLOT_BITS: usize = 6;
+
+/// Number of levels. Each level has 64 slots, so the wheel covers
+/// `2^(SLOT_BITS * NUM_LEVELS)` ticks before the top level wraps.
+///
+/// Without `test-util` ticks are milliseconds, and 6 levels cover ~2 years.
+/// With `test-util` ticks are nanoseconds (so paused-clock timers fire at
+/// exact deadlines); 10 levels cover ~36 years, keeping the top-level
+/// wraparound out of reach of any practical sleep.
+#[cfg(not(feature = "test-util"))]
 const NUM_LEVELS: usize = 6;
+#[cfg(feature = "test-util")]
+const NUM_LEVELS: usize = 10;
 
 /// The maximum duration of a `Sleep`.
-pub(super) const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
+pub(super) const MAX_DURATION: u64 = (1 << (SLOT_BITS * NUM_LEVELS)) - 1;
 
 impl Wheel {
     /// Creates a new timing wheel.
@@ -61,7 +68,7 @@ impl Wheel {
         }
     }
 
-    /// Returns the number of milliseconds that have elapsed since the timing
+    /// Returns the number of ticks that have elapsed since the timing
     /// wheel's creation.
     pub(crate) fn elapsed(&self) -> u64 {
         self.elapsed
@@ -198,6 +205,26 @@ impl Wheel {
         self.next_expiration().map(|ex| ex.deadline)
     }
 
+    /// Returns the smallest registered deadline of any timer in the wheel,
+    /// or `None` if the wheel is empty.
+    ///
+    /// `next_expiration_time` returns the *slot start* of the next-due
+    /// entry, which for upper levels is a (possibly coarse) lower bound;
+    /// this walks that one slot's entries to find the exact minimum
+    /// `registered_when`. Cost is linear in that slot's occupancy. Exact
+    /// when no entry in the slot has been lock-free-extended since its last
+    /// re-key; otherwise a sound lower bound (`true_when >=
+    /// registered_when`). Used by quiesce resolution and the auto-advance
+    /// target.
+    #[cfg(feature = "test-util")]
+    pub(super) fn next_when(&self) -> Option<u64> {
+        if !self.pending.is_empty() {
+            return Some(self.elapsed);
+        }
+        let exp = self.next_expiration()?;
+        self.levels[exp.level].min_when_in_slot(exp.slot)
+    }
+
     /// Used for debug assertions
     fn no_expirations_before(&self, start_level: usize, before: u64) -> bool {
         let mut res = true;
@@ -276,7 +303,7 @@ impl Wheel {
 }
 
 fn level_for(elapsed: u64, when: u64) -> usize {
-    const SLOT_MASK: u64 = (1 << 6) - 1;
+    const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 
     // Mask in the trailing bits ignored by the level calculation in order to cap
     // the possible leading zeros
@@ -290,7 +317,7 @@ fn level_for(elapsed: u64, when: u64) -> usize {
     let leading_zeros = masked.leading_zeros() as usize;
     let significant = 63 - leading_zeros;
 
-    significant / NUM_LEVELS
+    significant / SLOT_BITS
 }
 
 #[cfg(all(test, not(loom)))]

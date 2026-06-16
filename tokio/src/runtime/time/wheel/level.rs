@@ -145,6 +145,34 @@ impl Level {
 
         std::mem::take(&mut self.slot[slot])
     }
+
+    /// Smallest `registered_when` among the entries in `slot`. The driver
+    /// lock must be held.
+    ///
+    /// Reads `registered_when` (the wheel placement key), not `true_when`:
+    /// an entry extended via the lock-free `reset` fast path keeps its
+    /// `registered_when` until the wheel re-keys it, so its `true_when` can
+    /// be far past entries in later slots. `registered_when` is what the
+    /// wheel orders on, so the minimum over the next-due slot is the global
+    /// minimum -- a sound lower bound on every entry's actual fire time
+    /// (since `true_when >= registered_when` always), and exact whenever no
+    /// entry in the slot has an outstanding extend.
+    #[cfg(feature = "test-util")]
+    pub(super) fn min_when_in_slot(&self, slot: usize) -> Option<u64> {
+        let mut min = None;
+        // SAFETY: walks the intrusive list under the driver lock; entries are
+        // pinned for the lifetime of their registration.
+        unsafe {
+            self.slot[slot].for_each_link(|e| {
+                let w = e.registered_when();
+                match min {
+                    Some(m) if m <= w => {}
+                    _ => min = Some(w),
+                }
+            });
+        }
+        min
+    }
 }
 
 impl fmt::Debug for Level {
@@ -160,14 +188,14 @@ fn occupied_bit(slot: usize) -> u64 {
 }
 
 fn slot_range(level: usize) -> u64 {
-    LEVEL_MULT.pow(level as u32) as u64
+    (LEVEL_MULT as u64).pow(level as u32)
 }
 
 fn level_range(level: usize) -> u64 {
     LEVEL_MULT as u64 * slot_range(level)
 }
 
-/// Converts a duration (milliseconds) and a level to a slot position.
+/// Converts a tick value and a level to a slot position.
 fn slot_for(duration: u64, level: usize) -> usize {
     ((duration >> (level * 6)) % LEVEL_MULT as u64) as usize
 }
