@@ -88,6 +88,9 @@ mod clock;
 pub(crate) use self::clock::Clock;
 cfg_test_util! {
     pub use clock::{advance, pause, resume};
+
+    mod quiesce;
+    pub use quiesce::{quiesce, quiesce_until, Quiesce, QuiescedState};
 }
 
 pub mod error;

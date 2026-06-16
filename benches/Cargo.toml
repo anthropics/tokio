@@ -106,5 +106,10 @@ name = "remote_spawn"
 path = "remote_spawn.rs"
 harness = false
 
+[[bench]]
+name = "rt_quiesce"
+path = "rt_quiesce.rs"
+harness = false
+
 [lints]
 workspace = true

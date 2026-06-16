@@ -316,6 +316,27 @@ cfg_io_driver_impl! {
     }
 }
 
+cfg_test_util! {
+    impl<T: Link> LinkedList<T, T::Target> {
+        /// Walks the list head-to-tail, yielding a shared reference to each
+        /// linked target.
+        ///
+        /// SAFETY: the caller must hold whatever lock guards mutation of this
+        /// list; the references handed to `f` are valid only for the duration
+        /// of each call.
+        pub(crate) unsafe fn for_each_link<F>(&self, mut f: F)
+        where
+            F: FnMut(&T::Target),
+        {
+            let mut next = self.head;
+            while let Some(curr) = next {
+                f(unsafe { curr.as_ref() });
+                next = unsafe { T::pointers(curr).as_ref() }.get_next();
+            }
+        }
+    }
+}
+
 cfg_taskdump! {
     impl<T: Link> LinkedList<T, T::Target> {
         pub(crate) fn for_each<F>(&mut self, mut f: F)

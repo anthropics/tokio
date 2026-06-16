@@ -18,7 +18,9 @@ async fn immediate_sleep() {
 
     // Ready!
     time::sleep_until(now).await;
-    assert_elapsed!(now, ms(1));
+    // Registered while the clock is paused, the already-due sleep fires at
+    // its exact deadline -- no millisecond round-up, no auto-advance.
+    assert_elapsed!(now, ms(0));
 }
 
 #[tokio::test]
@@ -64,7 +66,9 @@ async fn sub_ms_delayed_sleep() {
 
         time::sleep_until(deadline).await;
 
-        assert_elapsed!(now, ms(1));
+        // Registered while the clock is paused, the sleep fires at its exact
+        // nanosecond deadline -- no millisecond round-up.
+        assert_eq!(Instant::now(), deadline);
     }
 }
 

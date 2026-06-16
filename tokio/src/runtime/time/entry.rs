@@ -573,7 +573,7 @@ impl TimerEntry {
         *this.deadline = new_time;
         *this.registered = reregister;
 
-        let tick = self.driver().time_source().deadline_to_tick(new_time);
+        let tick = self.register_when(new_time);
         let inner = match self.inner() {
             Some(inner) => inner,
             None => {
@@ -623,6 +623,25 @@ impl TimerEntry {
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     pub(crate) fn clock(&self) -> &super::Clock {
         self.driver.driver().clock()
+    }
+}
+
+cfg_test_util! {
+    impl TimerEntry {
+        /// Wheel tick for `deadline`. Under `test-util` ticks are
+        /// nanoseconds since driver start, so paused-clock timers fire at
+        /// exact deadlines.
+        fn register_when(&self, deadline: Instant) -> u64 {
+            self.driver().time_source().instant_to_nanos(deadline)
+        }
+    }
+}
+
+cfg_not_test_util! {
+    impl TimerEntry {
+        fn register_when(&self, deadline: Instant) -> u64 {
+            self.driver().time_source().deadline_to_tick(deadline)
+        }
     }
 }
 
@@ -691,3 +710,4 @@ impl TimerHandle {
         unsafe { self.inner.as_ref().state.fire(completed_state) }
     }
 }
+

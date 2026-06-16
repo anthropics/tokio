@@ -44,8 +44,10 @@ use std::{num::NonZeroU64, ptr::NonNull};
 /// or `park_timeout`. The time driver will perform no work unless `park` or
 /// `park_timeout` is called repeatedly.
 ///
-/// The driver has a resolution of one millisecond. Any unit of time that falls
-/// between milliseconds are rounded up to the next millisecond.
+/// Without `test-util` the driver has a resolution of one millisecond: any
+/// unit of time that falls between milliseconds is rounded up to the next
+/// millisecond. With `test-util` the wheel is keyed in nanoseconds instead,
+/// so paused-clock timers fire at their exact deadlines.
 ///
 /// When an instance is dropped, any outstanding [`Sleep`][sleep] instance that has not
 /// elapsed will be notified with an error. At this point, calling `poll` on the
@@ -60,13 +62,14 @@ use std::{num::NonZeroU64, ptr::NonNull};
 /// instant, and processes each entry for that slot. When the timer reaches the
 /// end of the wheel, it starts again at the beginning.
 ///
-/// The implementation maintains six wheels arranged in a set of levels. As the
-/// levels go up, the slots of the associated wheel represent larger intervals
-/// of time. At each level, the wheel has 64 slots. Each slot covers a range of
-/// time equal to the wheel at the lower level. At level zero, each slot
-/// represents one millisecond of time.
+/// The implementation maintains a hierarchy of wheels arranged in a set of
+/// levels. As the levels go up, the slots of the associated wheel represent
+/// larger intervals of time. At each level, the wheel has 64 slots. Each slot
+/// covers a range of time equal to the wheel at the lower level. At level
+/// zero, each slot represents one tick (one millisecond, or one nanosecond
+/// under `test-util`).
 ///
-/// The wheels are:
+/// With millisecond ticks the levels are:
 ///
 /// * Level 0: 64 x 1 millisecond slots.
 /// * Level 1: 64 x 64 millisecond slots.
@@ -74,6 +77,9 @@ use std::{num::NonZeroU64, ptr::NonNull};
 /// * Level 3: 64 x ~4 minute slots.
 /// * Level 4: 64 x ~4 hour slots.
 /// * Level 5: 64 x ~12 day slots.
+///
+/// With nanosecond ticks (`test-util`) there are ten levels covering ~36
+/// years; see [`wheel::Wheel`].
 ///
 /// When the timer processes entries at level zero, it will notify all the
 /// `Sleep` instances as their deadlines have been reached. For all higher
@@ -133,6 +139,93 @@ struct InnerState {
 
     /// Timer wheel.
     wheel: wheel::Wheel,
+
+    /// Registered quiesce waiters (test-util). Protected by the same mutex as the
+    /// wheel so the resolution decision (compare bounds against the earliest
+    /// pending deadline) is atomic.
+    ///
+    /// At most one entry is unresolved at any time -- registration refuses a
+    /// second in-progress step -- so resolution moves the clock to a single,
+    /// well-defined bound. Resolved entries are inert mailboxes awaiting
+    /// collection by their futures' next poll.
+    #[cfg(feature = "test-util")]
+    quiesce_waiters: Vec<QuiesceWaiter>,
+
+    /// Monotonic id source for quiesce waiter registrations.
+    #[cfg(feature = "test-util")]
+    next_quiesce_waiter_id: u64,
+}
+
+cfg_test_util! {
+    /// A registered quiesce waiter: a task waiting for the runtime to become
+    /// quiescent at or below a virtual-time bound.
+    struct QuiesceWaiter {
+        /// Registration id (handed back to the `Quiesce` future).
+        id: u64,
+
+        /// Inclusive bound in nanoseconds since driver start
+        /// (`instant_to_nanos`; exact, no round-up), or `None` for an
+        /// unbounded waiter (resolves only when the wheel is empty).
+        bound: Option<u64>,
+
+        /// Waker of the waiting task (or root future).
+        waker: std::task::Waker,
+
+        /// Filled at resolution; collected by the future's next poll.
+        result: Option<crate::time::QuiescedState>,
+    }
+
+    /// Outcome of polling a registered quiesce waiter.
+    pub(crate) enum QuiescePoll {
+        /// The waiter resolved; it has been removed from the registry.
+        Ready(crate::time::QuiescedState),
+
+        /// The waiter is registered but has not yet resolved.
+        Pending,
+
+        /// The waiter is no longer in the registry. The registry is only ever
+        /// drained wholesale by `Driver::shutdown`, so this means the driver shut
+        /// down after the waiter registered.
+        Missing,
+    }
+
+    /// Outcome of registering a quiesce waiter.
+    pub(crate) enum QuiesceRegister {
+        /// Registered; the id is handed back to the `Quiesce` future.
+        Registered(u64),
+
+        /// Another step is already in progress (an unresolved waiter is
+        /// registered). Only one step may be in progress at a time: resolving a
+        /// step moves the clock to that step's bound, and the clock can only land
+        /// on one bound.
+        Busy,
+
+        /// The driver is shutting down; registration refused.
+        Shutdown,
+    }
+}
+
+cfg_test_util! {
+    /// True if some registered, not-yet-resolved quiesce waiter would resolve
+    /// at the runtime's current virtual-time position (its bound lies below
+    /// every pending deadline). Such a waiter is owed a resolution by the
+    /// drain-park hook before the clock moves again; an auto-advance now
+    /// would cross its bound.
+    fn has_resolvable_quiesce_waiter(lock: &InnerState) -> bool {
+        if lock.quiesce_waiters.is_empty() {
+            return false;
+        }
+
+        let next_pending = lock.wheel.next_when();
+        lock.quiesce_waiters.iter().any(|waiter| {
+            waiter.result.is_none()
+                && match (waiter.bound, next_pending) {
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                    (Some(bound), Some(next)) => bound < next,
+                }
+        })
+    }
 }
 
 // ===== impl Driver =====
@@ -150,13 +243,23 @@ impl Driver {
             inner: Inner::Traditional {
                 state: Mutex::new(InnerState {
                     next_wake: None,
+
                     wheel: wheel::Wheel::new(),
+
+                    #[cfg(feature = "test-util")]
+                    quiesce_waiters: Vec::new(),
+
+                    #[cfg(feature = "test-util")]
+                    next_quiesce_waiter_id: 0,
                 }),
                 is_shutdown: AtomicBool::new(false),
 
                 #[cfg(feature = "test-util")]
                 did_wake: AtomicBool::new(false),
             },
+
+            #[cfg(feature = "test-util")]
+            quiesce_waiter_count: crate::loom::sync::atomic::AtomicUsize::new(0),
         };
 
         let driver = Driver { park };
@@ -175,6 +278,9 @@ impl Driver {
                 #[cfg(feature = "test-util")]
                 did_wake: AtomicBool::new(false),
             },
+
+            #[cfg(feature = "test-util")]
+            quiesce_waiter_count: crate::loom::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -207,6 +313,24 @@ impl Driver {
 
         handle.process_at_time(u64::MAX);
 
+        // Wake any registered quiesce waiters so they can observe the shutdown.
+        #[cfg(feature = "test-util")]
+        {
+            let mut lock = handle.inner.lock();
+            let waiters = std::mem::take(&mut lock.quiesce_waiters);
+            // The count mirrors the registry and is only mutated while holding the
+            // registry lock; reset it together with the drain. Orphaned `Quiesce`
+            // futures cannot do this themselves (their entries are already gone, so
+            // their deregistration is a no-op), and a stale count would make
+            // `resume()`/`advance()` through a still-live `Handle` report a phantom
+            // in-progress quiesce.
+            handle.quiesce_waiter_count.store(0, Ordering::Relaxed);
+            drop(lock);
+            for waiter in waiters {
+                waiter.waker.wake();
+            }
+        }
+
         self.park.shutdown(rt_handle);
     }
 
@@ -216,35 +340,47 @@ impl Driver {
 
         assert!(!handle.is_shutdown());
 
-        let next_wake = lock.wheel.next_expiration_time();
-        lock.next_wake =
-            next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        let next_wake_tick = lock.wheel.next_expiration_time();
+        lock.next_wake = next_wake_tick
+            .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
 
         drop(lock);
 
-        match next_wake {
-            Some(when) => {
-                let now = handle.time_source.now(rt_handle.clock());
-                // Note that we effectively round up to 1ms here - this avoids
-                // very short-duration microsecond-resolution sleeps that the OS
-                // might treat as zero-length.
-                let mut duration = handle
-                    .time_source
-                    .tick_to_duration(when.saturating_sub(now));
+        // Park duration to the next slot boundary. With test-util ticks are
+        // nanoseconds; with a running clock park_thread_timeout floors sub-ms
+        // durations back up to 1ms.
+        #[cfg(feature = "test-util")]
+        let next_dur = next_wake_tick.map(|when| {
+            let now_ns = handle.time_source.instant_to_nanos(rt_handle.clock().now());
+            Duration::from_nanos(when.saturating_sub(now_ns))
+        });
 
+        #[cfg(not(feature = "test-util"))]
+        let next_dur = next_wake_tick.map(|when| {
+            let now = handle.time_source.now(rt_handle.clock());
+            // Note that we effectively round up to 1ms here - this avoids
+            // very short-duration microsecond-resolution sleeps that the OS
+            // might treat as zero-length.
+            handle
+                .time_source
+                .tick_to_duration(when.saturating_sub(now))
+        });
+
+        match next_dur {
+            Some(mut duration) => {
                 if duration > Duration::from_millis(0) {
                     if let Some(limit) = limit {
                         duration = std::cmp::min(limit, duration);
                     }
 
-                    self.park_thread_timeout(rt_handle, duration);
+                    self.park_thread_timeout(rt_handle, duration, limit);
                 } else {
                     self.park.park_timeout(rt_handle, Duration::from_secs(0));
                 }
             }
             None => {
                 if let Some(duration) = limit {
-                    self.park_thread_timeout(rt_handle, duration);
+                    self.park_thread_timeout(rt_handle, duration, limit);
                 } else {
                     self.park.park(rt_handle);
                 }
@@ -256,7 +392,12 @@ impl Driver {
     }
 
     cfg_test_util! {
-        fn park_thread_timeout(&mut self, rt_handle: &driver::Handle, duration: Duration) {
+        fn park_thread_timeout(
+            &mut self,
+            rt_handle: &driver::Handle,
+            duration: Duration,
+            limit: Option<Duration>,
+        ) {
             let handle = rt_handle.time();
             let clock = rt_handle.clock();
 
@@ -267,20 +408,84 @@ impl Driver {
                 // before the "duration" elapsed (usually caused by a
                 // yield in `Runtime::block_on`). In this case, we don't
                 // advance the clock.
+                //
+                // This veto also makes the over-advance race with a
+                // concurrently released blocking-task inhibit benign: the
+                // release unparks the driver, which sets `did_wake`, so the
+                // advance below is skipped and the wake-up time is recomputed
+                // (the `quiesce_blocking_release_vs_park` loom model covers
+                // this ordering).
                 if !handle.did_wake() {
-                    // Simulate advancing time
-                    if let Err(msg) = clock.advance(duration) {
-                        panic!("{}", msg);
+                    // Re-validate before moving the clock; both checks must be
+                    // atomic with the advance itself:
+                    //
+                    // - A quiesce waiter registered since this park's bound
+                    //   was computed must not have its bound crossed. Holding
+                    //   the registry lock across the advance means a
+                    //   concurrent registration either lands before this
+                    //   check (and vetoes the advance) or after the advance
+                    //   has fully completed -- never in between. The
+                    //   `quiesce_register_vs_auto_advance` loom model pins
+                    //   this.
+                    // - An inhibit taken (a `spawn_blocking` spawned from
+                    //   another thread) or a `resume()` landing since
+                    //   `can_auto_advance()` must veto the advance;
+                    //   `try_auto_advance` re-checks under the clock lock.
+                    //
+                    // A vetoed advance is not lost: the scheduler loop parks
+                    // again, and the next pass recomputes the wake-up time or
+                    // the drain-park hook resolves the waiter.
+                    let lock = handle.inner.lock();
+                    if !has_resolvable_quiesce_waiter(&lock) {
+                        // Auto-advance to the *exact* earliest deadline, not
+                        // the slot start `duration` was computed from: that
+                        // way the following `process_at_time` cascades the
+                        // entry all the way down and fires it in one pass,
+                        // instead of one park-loop iteration per wheel
+                        // level. The slot-walk this costs is confined to the
+                        // paused single-thread auto-advance path; it never
+                        // runs on a multi-thread runtime, where it would
+                        // contend the driver lock with concurrent
+                        // registrations.
+                        let target = match lock.wheel.next_when() {
+                            Some(when) => {
+                                let now_ns =
+                                    handle.time_source.instant_to_nanos(clock.now());
+                                let d =
+                                    Duration::from_nanos(when.saturating_sub(now_ns));
+                                limit.map_or(d, |l| d.min(l))
+                            }
+                            None => duration,
+                        };
+                        clock.try_auto_advance(target);
                     }
+                    drop(lock);
                 }
             } else {
+                // Under a running clock, clamp sub-ms timeouts up to 1ms:
+                // very short OS sleeps may be treated as zero-length, and
+                // firing up to 1ms late matches the documented millisecond
+                // envelope. Never clamp the auto-advance branch above: that
+                // amount becomes virtual-time movement and must stay exact.
+                // And never clamp past the caller's park limit: the
+                // schedulers' yield-parks pass a zero limit and must remain
+                // non-blocking driver polls.
+                let mut duration = duration.max(Duration::from_millis(1));
+                if let Some(limit) = limit {
+                    duration = std::cmp::min(limit, duration);
+                }
                 self.park.park_timeout(rt_handle, duration);
             }
         }
     }
 
     cfg_not_test_util! {
-        fn park_thread_timeout(&mut self, rt_handle: &driver::Handle, duration: Duration) {
+        fn park_thread_timeout(
+            &mut self,
+            rt_handle: &driver::Handle,
+            duration: Duration,
+            _limit: Option<Duration>,
+        ) {
             self.park.park_timeout(rt_handle, duration);
         }
     }
@@ -288,7 +493,11 @@ impl Driver {
 
 impl Handle {
     pub(self) fn process(&self, clock: &Clock) {
-        let now = self.time_source().now(clock);
+        let now_instant = clock.now();
+        #[cfg(feature = "test-util")]
+        let now = self.time_source().instant_to_nanos(now_instant);
+        #[cfg(not(feature = "test-util"))]
+        let now = self.time_source().instant_to_tick(now_instant);
 
         self.process_at_time(now);
     }
@@ -373,7 +582,8 @@ impl Handle {
     /// invoked. If the timer is already completed, this function is a no-op.
     ///
     /// This function always acquires the driver lock, even if the entry does
-    /// not appear to be registered.
+    /// not appear to be registered: that lock acquisition is the `acq/rel`
+    /// fence `TimerEntry::cancel` relies on for cross-thread drops.
     ///
     /// SAFETY: The timer must not be registered with some other driver, and
     /// `add_entry` must not be called concurrently.
@@ -406,7 +616,7 @@ impl Handle {
 
             // We may have raced with a firing/deregistration, so check before
             // deregistering.
-            if unsafe { entry.as_ref().might_be_registered() } {
+            if entry.as_ref().might_be_registered() {
                 lock.wheel.remove(entry);
             }
 
@@ -457,6 +667,195 @@ impl Handle {
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
                 Inner::Alternative { did_wake, .. } => did_wake.swap(false, Ordering::SeqCst),
             }
+        }
+
+        /// Fast-path check for the scheduler's drain-park hook: are any quiesce
+        /// waiters registered?
+        ///
+        /// A single relaxed load; when this returns `false` the hook does nothing
+        /// else.
+        pub(crate) fn has_quiesce_waiters(&self) -> bool {
+            self.quiesce_waiter_count.load(Ordering::Relaxed) > 0
+        }
+
+        /// Registers a quiesce waiter with an optional inclusive bound (as an
+        /// `Instant`; converted to exact nanoseconds since driver start, no
+        /// round-up).
+        ///
+        /// Refuses the registration when another step is in progress (an
+        /// unresolved waiter is already registered): resolving a step moves the
+        /// clock to that step's bound, so only one step may be in progress at a
+        /// time. A resolved-but-uncollected waiter does not block registration --
+        /// its step is over; the entry is only a mailbox its future has yet to
+        /// drain.
+        ///
+        /// The shutdown check happens under the registry lock: `Driver::shutdown`
+        /// stores the shutdown flag before taking this same lock to drain the
+        /// registry, so a registration that observes the flag unset is guaranteed
+        /// to land before the drain (and be woken by it), while one that observes
+        /// it set must not land at all -- a waiter registered after the drain would
+        /// never be woken.
+        ///
+        /// The caller is responsible for unparking the target runtime's driver
+        /// afterwards so a parked runtime notices the new waiter; this handle alone
+        /// cannot do that (it can only set the time driver's `did_wake` flag, not
+        /// wake the runtime thread).
+        pub(crate) fn register_quiesce_waiter(
+            &self,
+            bound: Option<crate::time::Instant>,
+            waker: &std::task::Waker,
+        ) -> QuiesceRegister {
+            let bound_ns = bound.map(|b| self.time_source.instant_to_nanos(b));
+
+            let mut lock = self.inner.lock();
+
+            if self.is_shutdown() {
+                return QuiesceRegister::Shutdown;
+            }
+
+            if lock.quiesce_waiters.iter().any(|w| w.result.is_none()) {
+                return QuiesceRegister::Busy;
+            }
+
+            let id = lock.next_quiesce_waiter_id;
+            lock.next_quiesce_waiter_id += 1;
+            lock.quiesce_waiters.push(QuiesceWaiter {
+                id,
+                bound: bound_ns,
+                waker: waker.clone(),
+                result: None,
+            });
+            // Increment under the lock so the scheduler's (lock-free) fast path can
+            // never observe count > 0 without the registry entry being visible once
+            // it takes the lock.
+            self.quiesce_waiter_count.fetch_add(1, Ordering::Relaxed);
+            drop(lock);
+
+            QuiesceRegister::Registered(id)
+        }
+
+        /// Polls a registered waiter: if it has resolved, removes it and returns the
+        /// report; otherwise refreshes its waker.
+        ///
+        /// Returns [`QuiescePoll::Missing`] if the waiter is not in the registry,
+        /// which happens when the driver shut down (and drained the registry)
+        /// concurrently with this poll. The caller decides how to surface that.
+        pub(crate) fn poll_quiesce_waiter(
+            &self,
+            id: u64,
+            waker: &std::task::Waker,
+        ) -> QuiescePoll {
+            let mut lock = self.inner.lock();
+            let idx = match lock.quiesce_waiters.iter().position(|w| w.id == id) {
+                Some(idx) => idx,
+                None => return QuiescePoll::Missing,
+            };
+
+            match lock.quiesce_waiters[idx].result {
+                Some(result) => {
+                    lock.quiesce_waiters.swap_remove(idx);
+                    self.quiesce_waiter_count.fetch_sub(1, Ordering::Relaxed);
+                    QuiescePoll::Ready(result)
+                }
+                None => {
+                    if !lock.quiesce_waiters[idx].waker.will_wake(waker) {
+                        lock.quiesce_waiters[idx].waker = waker.clone();
+                    }
+                    QuiescePoll::Pending
+                }
+            }
+        }
+
+        /// Removes a registered waiter (called when a `Quiesce` future is dropped
+        /// before collecting its result). Idempotent.
+        pub(crate) fn deregister_quiesce_waiter(&self, id: u64) {
+            let mut lock = self.inner.lock();
+            if let Some(idx) = lock.quiesce_waiters.iter().position(|w| w.id == id) {
+                lock.quiesce_waiters.swap_remove(idx);
+                self.quiesce_waiter_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Resolution pass run by the `current_thread` scheduler's drain-park hook.
+        ///
+        /// Caller contract (enforced by the hook, not re-checked here): nothing is
+        /// runnable, no blocking task is outstanding, and a zero-timeout driver poll
+        /// has just completed (so all timers due at the current virtual time have
+        /// fired).
+        ///
+        /// At most one unresolved waiter can be registered (registration refuses a
+        /// second in-progress step). It resolves when its bound lies strictly below
+        /// the earliest pending timer deadline — or
+        /// unconditionally when the wheel is empty. On resolution the clock is advanced
+        /// to land exactly on the bound (when the bound lies ahead of the clock):
+        /// the resolution condition proves every pending deadline lies strictly
+        /// beyond the bound, so the move crosses no timer and fires nothing — the
+        /// runtime is exactly as quiescent after the move as before it. An
+        /// unbounded waiter, or a bound at or before the clock's position, leaves
+        /// the clock untouched.
+        ///
+        /// Returns true if the waiter was resolved (the caller must then SKIP the
+        /// park).
+        ///
+        /// The clock advance happens under the registry lock, in the same
+        /// inner-then-clock nesting order `park_thread_timeout` uses for
+        /// `try_auto_advance`. The waker is invoked only after the lock is dropped
+        /// (the same lock-safety rule `process_at_time` follows).
+        pub(crate) fn resolve_quiesce_waiter(&self, clock: &Clock) -> bool {
+            let mut lock = self.inner.lock();
+
+            let next_when = lock.wheel.next_when();
+
+            let Some(waiter) = lock
+                .quiesce_waiters
+                .iter_mut()
+                .find(|w| w.result.is_none())
+            else {
+                return false;
+            };
+
+            let resolves = match (waiter.bound, next_when) {
+                // No pending timers: the waiter (bounded or not) resolves.
+                (_, None) => true,
+                // Unbounded waiter, timers pending: keep waiting.
+                (None, Some(_)) => false,
+                // Bounded waiter: resolves iff every pending timer lies strictly
+                // beyond the bound (both in ns; the strict `<` is what makes the
+                // caller-facing bound inclusive).
+                (Some(bound), Some(next)) => bound < next,
+            };
+
+            if !resolves {
+                return false;
+            }
+
+            // Land the clock exactly on the bound. The clock is necessarily still
+            // paused: `resume()` panics while a waiter is registered.
+            if let Some(bound_ns) = waiter.bound {
+                let now_ns = self.time_source.instant_to_nanos(clock.now());
+                if bound_ns > now_ns {
+                    clock
+                        .advance(Duration::from_nanos(bound_ns - now_ns))
+                        .expect("clock must be paused while a quiesce step is registered");
+                }
+            }
+            let now = clock.now();
+
+            // The clock move cannot change the wheel: no deadline at or
+            // before the bound exists, so `next_when` (computed pre-advance)
+            // is still the earliest pending timer.
+            let next_timer = next_when.map(|w| self.time_source.nanos_to_instant(w));
+
+            waiter.result = Some(crate::time::QuiescedState { now, next_timer });
+            let waker = waiter.waker.clone();
+
+            drop(lock);
+
+            // Wake outside the lock: a waker may run arbitrary code (task scheduling),
+            // and waking under the registry/wheel lock risks lock-order inversions.
+            waker.wake();
+
+            true
         }
     }
 }

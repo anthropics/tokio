@@ -440,7 +440,7 @@ impl Context {
             core.metrics.about_to_park();
             core.submit_metrics(handle);
 
-            core = self.park_internal(core, handle, &mut driver, None);
+            core = self.park_drain(core, handle, &mut driver);
 
             core.metrics.unparked();
             core.submit_metrics(handle);
@@ -465,6 +465,151 @@ impl Context {
 
         core.driver = Some(driver);
         core
+    }
+
+    /// Takes the drain-park: parks the thread until an event arrives.
+    ///
+    /// With `test-util`, registered `quiesce()` waiters are given a chance to resolve
+    /// first. The park is skipped when the resolution pass either resolves a waiter
+    /// (the woken waiter is now runnable work) or discovers other runnable work
+    /// (which the pass's driver poll may have consumed the wakeup for — parking then
+    /// would never wake up).
+    #[cfg(feature = "test-util")]
+    fn park_drain(&self, core: Box<Core>, handle: &Handle, driver: &mut Driver) -> Box<Core> {
+        let (core, skip_park) = self.quiesce_park_hook(core, handle, driver);
+
+        if skip_park {
+            core
+        } else {
+            self.park_internal(core, handle, driver, None)
+        }
+    }
+
+    #[cfg(not(feature = "test-util"))]
+    fn park_drain(&self, core: Box<Core>, handle: &Handle, driver: &mut Driver) -> Box<Core> {
+        self.park_internal(core, handle, driver, None)
+    }
+
+    /// Quiesce resolution pass, run at the drain-park only.
+    ///
+    /// Preconditions (guaranteed by the caller): the run queue is empty, the deferred
+    /// list is empty, and the root future is not woken (`has_pending_work` returned
+    /// false).
+    ///
+    /// Inside a single scheduler `enter` scope (so that any task wakes triggered here
+    /// land on the run queue rather than being dropped as shutdown wakes):
+    ///
+    ///  1. Performs a zero-timeout driver poll. This surfaces IO readiness, fires
+    ///     timers already due at the current (paused, unmoved) virtual time, and lets
+    ///     raced cross-thread wakes land.
+    ///
+    ///     This poll CONSUMES any pending wakeup: the IO driver's wakeup event is
+    ///     observed once and discarded, and the time driver's `did_wake` flag is
+    ///     destructively read by `park_thread_timeout`'s auto-advance branch (the
+    ///     zero-duration "advance" itself is a no-op). Once the poll has run, a
+    ///     wakeup that was pending before it can no longer terminate a later park.
+    ///
+    ///  2. Reads the blocking-inhibit count, BEFORE the runnable-work re-check. The
+    ///     count is decremented by a completing `spawn_blocking` task only after its
+    ///     body ran (`BlockingSchedule::release`), so observing "no inhibits" here
+    ///     guarantees that step 3 sees any work a completed blocking task published
+    ///     (for example a channel send performed inside the blocking closure).
+    ///     Reading it in the other order would allow a blocking task to complete
+    ///     between the two checks and have its final wakes miss both.
+    ///
+    ///  3. Re-checks whether anything became runnable: run queue, deferred wakers,
+    ///     the root future's woken flag, and the inject queue. If so, the park MUST
+    ///     be skipped — the wakeup announcing that work was just consumed by step 1,
+    ///     so an indefinite park would never wake. Skipping the park returns to the
+    ///     scheduler loop, which processes the work and comes back here.
+    ///
+    ///     This re-check is also what makes consuming `did_wake` in step 1 sound:
+    ///     every `did_wake` setter publishes its work (inject push, woken flag,
+    ///     blocking-inhibit release) before unparking, so the re-check observes
+    ///     that work and the park — and therefore any auto-advance the flag would
+    ///     have vetoed — is skipped. When the re-check finds nothing, the wake has
+    ///     been fully serviced and a subsequent auto-advance is correct.
+    ///
+    ///  4. If nothing is runnable but a `spawn_blocking` task was outstanding at
+    ///     step 2, the runtime is not quiescent (blocking work implies future
+    ///     wakes); fall through to the real park. This cannot lose a wakeup: the
+    ///     inhibit was observed as held, so the blocking task's release — which
+    ///     decrements the count and THEN unparks the driver — had not yet run at
+    ///     step 2, which is after the poll in step 1; its unpark therefore cannot
+    ///     have been consumed and will terminate the park.
+    ///
+    ///  5. Otherwise resolves the registered step (at most one is in progress)
+    ///     when its bound lies strictly below the earliest pending deadline across
+    ///     the exact store and the wheel (or unconditionally when both are empty),
+    ///     waking the waiter inside this `enter` scope. Resolution lands the clock
+    ///     exactly on the step's bound -- a move the resolution condition proves
+    ///     crosses no timer.
+    ///
+    /// Returns `(core, skip_park)`. `skip_park` is true when runnable work was
+    /// discovered (step 3) or the step resolved (step 5); the caller must then
+    /// skip the park. The only clock movement on a skipped-park cycle is the
+    /// resolve pass landing the clock on the resolved step's bound.
+    #[cfg(feature = "test-util")]
+    fn quiesce_park_hook(
+        &self,
+        core: Box<Core>,
+        handle: &Handle,
+        driver: &mut Driver,
+    ) -> (Box<Core>, bool) {
+        // Fast path: no waiter registered (and no time driver means no waiters can
+        // exist). One relaxed atomic load, no locks.
+        let has_waiters = match &handle.driver.time {
+            Some(time_handle) => time_handle.has_quiesce_waiters(),
+            None => false,
+        };
+        if !has_waiters {
+            return (core, false);
+        }
+
+        // `self.enter` returns `(core, R)`; `R` is the closure's skip-park decision.
+        self.enter(core, || {
+            // (1) Zero-timeout driver poll. Tasks woken here (timer firings, IO
+            // readiness) are pushed onto the core inside the RefCell via the normal
+            // Schedule::schedule path.
+            driver.park_timeout(&handle.driver, Duration::from_millis(0));
+            self.defer.wake();
+
+            // (2) Blocking-inhibit read; must happen before the runnable-work
+            // re-check (see the doc comment).
+            let blocking_inhibited = handle.driver.clock.has_auto_advance_inhibits();
+
+            // (3) Runnable-work re-check. The core lives in the Context RefCell while
+            // inside `enter`.
+            let runnable = {
+                let core_ref = self.core.borrow();
+                let core_ref = core_ref.as_ref().expect("core missing");
+                !core_ref.tasks.is_empty()
+            } || !self.defer.is_empty()
+                || handle.shared.woken.load(Acquire)
+                || handle.injection_queue_depth() > 0;
+
+            if runnable {
+                // The wakeup that announced this work may have been consumed by the
+                // poll above; parking now could hang forever. Skip the park.
+                return true;
+            }
+
+            // (4) Outstanding blocking work: not quiescent, and parking is safe (the
+            // blocking completion's unpark cannot have been consumed yet; see the doc
+            // comment).
+            if blocking_inhibited {
+                return false;
+            }
+
+            // (5) Resolve the registered step if its bound is clear of every
+            // pending timer (landing the clock on the bound). The wake happens
+            // inside this `enter` scope, so a spawned-task waiter lands on the run
+            // queue and a root-future waiter sets the `woken` flag.
+            match &handle.driver.time {
+                Some(time_handle) => time_handle.resolve_quiesce_waiter(&handle.driver.clock),
+                None => false,
+            }
+        })
     }
 
     fn has_pending_work(&self, core: &Core) -> bool {

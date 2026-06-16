@@ -132,6 +132,41 @@ fn spawn_blocking_then_shutdown() {
     });
 }
 
+#[test]
+fn quiesce_vs_blocking_release() {
+    loom::model(|| {
+        let rt = crate::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        {
+            let done = done.clone();
+            let _enter = rt.handle().enter();
+            // A blocking task, and an async task that awaits its completion. The
+            // async task setting `done` is "the completion has been processed".
+            let jh = crate::task::spawn_blocking(|| {});
+            rt.handle().spawn(async move {
+                jh.await.expect("blocking task failed");
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+
+        // Unbounded quiesce: must not resolve until the blocking task completed AND
+        // the async task processing its completion has run. The blocking pool thread
+        // runs `BlockingSchedule::release` (decrement blocking count -> wake the
+        // JoinHandle waiter -> unpark) racing with the scheduler's drain-park hook
+        // reading the blocking count.
+        let _ = rt.block_on(crate::time::quiesce());
+
+        // The contract under EVERY interleaving of release vs drain-park.
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    });
+}
+
 fn mk_runtime(num_threads: usize) -> Runtime {
     runtime::Builder::new_multi_thread()
         .worker_threads(num_threads)

@@ -1,4 +1,4 @@
-316
+323
 &
 +
 <
@@ -100,6 +100,7 @@ destructor
 destructors
 destructure
 Destructures
+deterministically
 Dev
 dns
 DNS
@@ -192,6 +193,7 @@ namespace
 nonblocking
 nondecreasing
 noop
+ns
 ntasks
 NUMA
 ok
@@ -209,9 +211,12 @@ poller
 POSIX
 proxied
 qos
+quiesce
+quiesced
 RAII
 RCU
 reallocations
+recomputation
 recv's
 refactors
 refcount
@@ -219,11 +224,13 @@ refcounting
 repo
 repr
 representable
+reproducibility
 reqwest
 reregistering
 resize
 resized
 RMW
+runnable
 runtime
 runtime's
 runtimes
