@@ -211,8 +211,8 @@ impl CurrentThread {
                     #[cfg(feature = "stall-detection")]
                     {
                         #[cfg(target_os = "linux")]
-                        // SAFETY: gettid() is always safe to call.
-                        let tid = unsafe { libc::gettid() } as u64;
+                        // SAFETY: SYS_gettid is always safe to call.
+                        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
                         #[cfg(not(target_os = "linux"))]
                         let tid = 0u64;
 
