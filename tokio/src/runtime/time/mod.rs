@@ -437,27 +437,24 @@ impl Driver {
                     // the drain-park hook resolves the waiter.
                     let lock = handle.inner.lock();
                     if !has_resolvable_quiesce_waiter(&lock) {
-                        // Auto-advance to the *exact* earliest deadline, not
-                        // the slot start `duration` was computed from: that
-                        // way the following `process_at_time` cascades the
-                        // entry all the way down and fires it in one pass,
-                        // instead of one park-loop iteration per wheel
-                        // level. The slot-walk this costs is confined to the
-                        // paused single-thread auto-advance path; it never
-                        // runs on a multi-thread runtime, where it would
-                        // contend the driver lock with concurrent
-                        // registrations.
-                        let target = match lock.wheel.next_when() {
-                            Some(when) => {
-                                let now_ns =
-                                    handle.time_source.instant_to_nanos(clock.now());
-                                let d =
-                                    Duration::from_nanos(when.saturating_sub(now_ns));
-                                limit.map_or(d, |l| d.min(l))
-                            }
-                            None => duration,
-                        };
-                        clock.try_auto_advance(target);
+                        // Advance by `duration` -- the slot-start delta the
+                        // caller computed -- not by the exact deadline
+                        // (`next_when()`). The zero-timeout poll above may
+                        // have woken tasks via IO readiness; those wakes go
+                        // through the local-queue path (the core is in the
+                        // scheduler context during `park_internal`) and so
+                        // do NOT set `did_wake`. Advancing only to the slot
+                        // start cascades an upper-level timer one level down
+                        // without firing it, returning to the run loop so
+                        // those IO-woken tasks run before the next park
+                        // iteration. Advancing to the exact deadline would
+                        // fire the timer in this same pass -- a
+                        // `timeout(D, io)` whose `io` is satisfied by a
+                        // sibling task would always lose to its own
+                        // timeout. Level-0 slots are 1ns under `test-util`,
+                        // so the final cascade still lands on the exact
+                        // deadline.
+                        clock.try_auto_advance(duration);
                     }
                     drop(lock);
                 }
