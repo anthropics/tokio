@@ -214,8 +214,8 @@ impl Wheel {
     /// `registered_when`. Cost is linear in that slot's occupancy. Exact
     /// when no entry in the slot has been lock-free-extended since its last
     /// re-key; otherwise a sound lower bound (`true_when >=
-    /// registered_when`). Used by quiesce resolution and the auto-advance
-    /// target.
+    /// registered_when`). Used by quiesce resolution and `next_timer`
+    /// reporting.
     #[cfg(feature = "test-util")]
     pub(super) fn next_when(&self) -> Option<u64> {
         if !self.pending.is_empty() {
