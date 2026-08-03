@@ -500,6 +500,16 @@ enum WorkerState {
     Idle,
     WaitingForResolution {
         stall_start: std::time::Instant,
+        /// The (odd) generation the worker is stalled at.
+        stalled_gen: u64,
+        /// Latched true once the worker's `blocked_in_place_generation` is
+        /// observed equal to `stalled_gen`. Latched (re-checked every tick)
+        /// rather than read once at detection or only at emit: the stalled
+        /// poll may call `block_in_place` after detection or escalation (the
+        /// resolution event must still carry the flag), and after resolution
+        /// a later poll's `block_in_place` can overwrite the single tag slot
+        /// before the emit tick (the flag must not be lost).
+        blocked: bool,
         trace: usize, // index into stored_traces, stored_kernel_stacks, stored_thread_names, stored_blocking
         escalated: bool,
     },
@@ -534,6 +544,14 @@ pub struct StallInfo {
     /// not the kernel-truncated `comm`. `None` if the worker had no thread
     /// name set.
     pub thread_name: Option<String>,
+    /// Whether the stalled poll handed its core off via
+    /// [`block_in_place`](crate::task::block_in_place).
+    ///
+    /// `true` means the "stall" is the gap between the core handoff and
+    /// another thread claiming the core (e.g. blocking pool saturation) -- the
+    /// worker was released, not held hostage by the poll. `false` means the
+    /// poll kept the worker occupied for the full stall duration.
+    pub blocked_in_place: bool,
 }
 
 /// Callback type for stall events.
@@ -677,6 +695,8 @@ fn run_monitor(
                         stored_blocking.push(blocking);
                         worker_states[i] = WorkerState::WaitingForResolution {
                             stall_start: std::time::Instant::now(),
+                            stalled_gen: gen,
+                            blocked: metrics.worker_blocked_in_place_generation(i) == gen,
                             trace: trace_idx,
                             escalated: false,
                         };
@@ -684,9 +704,16 @@ fn run_monitor(
                 }
                 WorkerState::WaitingForResolution {
                     stall_start,
+                    stalled_gen,
+                    ref mut blocked,
                     trace,
                     ref mut escalated,
                 } => {
+                    // See the `blocked` field docs for why this latches on
+                    // every tick.
+                    *blocked =
+                        *blocked || metrics.worker_blocked_in_place_generation(i) == stalled_gen;
+                    let blocked = *blocked;
                     if gen != prev_gen[i] {
                         // Stall resolved
                         let duration = stall_start.elapsed();
@@ -698,6 +725,7 @@ fn run_monitor(
                             &stored_kernel_stacks[trace],
                             &stored_thread_names[trace],
                             stored_blocking[trace],
+                            blocked,
                         );
                         worker_states[i] = WorkerState::Idle;
                     } else if !*escalated && stall_start.elapsed() > config.escalation_threshold {
@@ -711,6 +739,7 @@ fn run_monitor(
                             &stored_kernel_stacks[trace],
                             &stored_thread_names[trace],
                             stored_blocking[trace],
+                            blocked,
                         );
                         *escalated = true;
                     }
@@ -835,6 +864,7 @@ fn emit_resolved(
     kernel_stack: &Option<String>,
     thread_name: &Option<String>,
     blocking: BlockingPoolSnapshot,
+    blocked_in_place: bool,
 ) {
     // Always emit via tracing for observability.
     let symbolicated = symbolicate_trace(trace_ips);
@@ -847,6 +877,7 @@ fn emit_resolved(
         blocking_thread_cap = blocking.thread_cap,
         blocking_idle = blocking.num_idle_threads,
         blocking_queued = blocking.queue_depth,
+        blocked_in_place = blocked_in_place,
         "Scheduler stall on worker {} resolved after {:.1}ms\n{}",
         worker,
         duration.as_secs_f64() * 1000.0,
@@ -863,6 +894,7 @@ fn emit_resolved(
             symbolicated_frames: symbolicated,
             kernel_stack: kernel_stack.clone(),
             thread_name: thread_name.clone(),
+            blocked_in_place,
         });
     }
 }
@@ -876,6 +908,7 @@ fn emit_escalation(
     kernel_stack: &Option<String>,
     thread_name: &Option<String>,
     blocking: BlockingPoolSnapshot,
+    blocked_in_place: bool,
 ) {
     // Always emit via tracing for observability.
     let symbolicated = symbolicate_trace(trace_ips);
@@ -888,6 +921,7 @@ fn emit_escalation(
         blocking_thread_cap = blocking.thread_cap,
         blocking_idle = blocking.num_idle_threads,
         blocking_queued = blocking.queue_depth,
+        blocked_in_place = blocked_in_place,
         "Worker {} has been stalled for {:.1}s and counting!\n{}",
         worker,
         duration.as_secs_f64(),
@@ -904,6 +938,7 @@ fn emit_escalation(
             symbolicated_frames: symbolicated,
             kernel_stack: kernel_stack.clone(),
             thread_name: thread_name.clone(),
+            blocked_in_place,
         });
     }
 }
