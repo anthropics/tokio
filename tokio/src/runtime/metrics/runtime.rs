@@ -129,8 +129,10 @@ impl RuntimeMetrics {
         /// core off via `block_in_place`, or 0 if it never has.
         ///
         /// If this equals a stalled (odd) value observed via
-        /// [`worker_poll_generation`], the stalled poll released its core rather
-        /// than holding the worker hostage.
+        /// [`worker_poll_generation`], the stalled poll released its core via
+        /// `block_in_place` at some point during that poll (see
+        /// [`StallInfo::blocked_in_place`](crate::runtime::StallInfo::blocked_in_place)
+        /// for the exact semantics).
         ///
         /// [`worker_poll_generation`]: RuntimeMetrics::worker_poll_generation
         ///

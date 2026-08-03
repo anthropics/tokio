@@ -508,7 +508,9 @@ enum WorkerState {
         /// poll may call `block_in_place` after detection or escalation (the
         /// resolution event must still carry the flag), and after resolution
         /// a later poll's `block_in_place` can overwrite the single tag slot
-        /// before the emit tick (the flag must not be lost).
+        /// before the emit tick. Best-effort: if the handoff, resolution, and
+        /// a later poll's overwrite all land within one tick, no tick observes
+        /// `tag == stalled_gen` and the flag is missed.
         blocked: bool,
         trace: usize, // index into stored_traces, stored_kernel_stacks, stored_thread_names, stored_blocking
         escalated: bool,
@@ -545,12 +547,17 @@ pub struct StallInfo {
     /// name set.
     pub thread_name: Option<String>,
     /// Whether the stalled poll handed its core off via
-    /// [`block_in_place`](crate::task::block_in_place).
+    /// [`block_in_place`](crate::task::block_in_place) at some point.
     ///
-    /// `true` means the "stall" is the gap between the core handoff and
-    /// another thread claiming the core (e.g. blocking pool saturation) -- the
-    /// worker was released, not held hostage by the poll. `false` means the
-    /// poll kept the worker occupied for the full stall duration.
+    /// Typically `true` means the "stall" is the gap between the core handoff
+    /// and another thread claiming the core (e.g. blocking pool saturation)
+    /// rather than the poll holding the worker hostage. It is a per-poll
+    /// marker, not a per-duration accounting: if the handed-off core is never
+    /// claimed and the same thread reclaims it on exit, the poll continues on
+    /// the worker under the same generation, so time spent on the worker
+    /// before or after the blocking section is still attributed to a
+    /// `blocked_in_place` stall. `false` means the poll never released its
+    /// core.
     pub blocked_in_place: bool,
 }
 
