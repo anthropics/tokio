@@ -70,6 +70,13 @@ pub(crate) struct WorkerMetrics {
     #[cfg(feature = "stall-detection")]
     pub(crate) poll_generation: std::sync::atomic::AtomicU64,
 
+    /// The `poll_generation` value at which a poll on this worker last handed
+    /// its core off via `block_in_place`. 0 = never. A high-water tag, never
+    /// cleared: generations are strictly increasing, so a stale tag can never
+    /// equal a later stalled generation.
+    #[cfg(feature = "stall-detection")]
+    pub(crate) blocked_in_place_generation: std::sync::atomic::AtomicU64,
+
     /// OS thread ID of the worker thread (e.g. from gettid() on Linux). 0 = unset.
     #[cfg(feature = "stall-detection")]
     pub(crate) os_thread_id: std::sync::atomic::AtomicU64,
