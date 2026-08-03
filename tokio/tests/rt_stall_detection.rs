@@ -441,3 +441,183 @@ fn on_stall_callback_receives_thread_name() {
     // consumers can zip them.
     assert_eq!(info.backtrace_frames.len(), info.symbolicated_frames.len());
 }
+
+// --- blocked_in_place flag ---
+
+type StallEvents = std::sync::Arc<std::sync::Mutex<Vec<tokio::runtime::StallInfo>>>;
+
+/// Shared harness for the `blocked_in_place` tests: a 1-worker runtime with a
+/// 1-thread blocking pool, a fast monitor, and an `on_stall` collector.
+fn blocked_in_place_runtime(escalation: std::time::Duration) -> (Runtime, StallEvents) {
+    use std::sync::{Arc, Mutex};
+
+    let events: StallEvents = Arc::new(Mutex::new(Vec::new()));
+    let events_cb = events.clone();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_stall_detection()
+        .stall_detection_poll_interval(std::time::Duration::from_millis(50))
+        .stall_detection_escalation_threshold(escalation)
+        .on_stall(move |info| {
+            events_cb.lock().unwrap().push(info);
+        })
+        .enable_all()
+        .build()
+        .unwrap();
+
+    (rt, events)
+}
+
+/// Occupy the runtime's only blocking-pool thread for `dur`, returning once
+/// the blocker has actually started. A `block_in_place` core handoff issued
+/// after this is guaranteed to queue behind it, keeping the worker's
+/// generation stalled odd for the monitor to observe.
+async fn saturate_blocking_pool(dur: std::time::Duration) -> tokio::task::JoinHandle<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::task::spawn_blocking(move || {
+        tx.send(()).unwrap();
+        std::thread::sleep(dur);
+    });
+    rx.await.unwrap();
+    handle
+}
+
+/// Assert at least one stall event was collected and every event carries the
+/// expected `blocked_in_place` value.
+fn assert_events_flagged(events: &StallEvents, expected: bool) {
+    let events = events.lock().unwrap();
+    assert!(
+        !events.is_empty(),
+        "expected at least one stall event, got none"
+    );
+    for info in events.iter() {
+        assert_eq!(
+            info.blocked_in_place, expected,
+            "unexpected blocked_in_place: {info:?}"
+        );
+    }
+}
+
+/// A stall whose poll released its core via `block_in_place` must be reported
+/// with `blocked_in_place == true`.
+#[test]
+fn block_in_place_stall_is_flagged() {
+    let (rt, events) = blocked_in_place_runtime(std::time::Duration::from_secs(60));
+
+    rt.block_on(async {
+        let blocker = saturate_blocking_pool(std::time::Duration::from_millis(700)).await;
+
+        tokio::spawn(async {
+            tokio::task::block_in_place(|| {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            });
+        })
+        .await
+        .unwrap();
+
+        blocker.await.unwrap();
+    });
+
+    // Give the monitor a moment to observe the resolved stall.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    assert_events_flagged(&events, true);
+}
+
+/// A stall from a poll that simply blocks the worker (no core handoff) must be
+/// reported with `blocked_in_place == false`.
+#[test]
+fn raw_blocking_stall_is_not_flagged() {
+    let (rt, events) = blocked_in_place_runtime(std::time::Duration::from_secs(60));
+
+    rt.block_on(async {
+        tokio::spawn(async {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        })
+        .await
+        .unwrap();
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    assert_events_flagged(&events, false);
+}
+
+/// Nested `block_in_place` calls are a no-op past the outermost one; the flag
+/// must still be set (idempotently) for the stalled poll.
+#[test]
+fn nested_block_in_place_stall_is_flagged() {
+    let (rt, events) = blocked_in_place_runtime(std::time::Duration::from_secs(60));
+
+    rt.block_on(async {
+        let blocker = saturate_blocking_pool(std::time::Duration::from_millis(700)).await;
+
+        tokio::spawn(async {
+            tokio::task::block_in_place(|| {
+                tokio::task::block_in_place(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                });
+            });
+        })
+        .await
+        .unwrap();
+
+        blocker.await.unwrap();
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    assert_events_flagged(&events, true);
+}
+
+/// A poll that first blocks the worker outright (long enough to escalate) and
+/// only then calls `block_in_place` must still get `blocked_in_place == true`
+/// on the resolution event: the flag is latched on every monitor tick, not
+/// captured once at detection.
+#[test]
+fn block_in_place_after_escalation_flags_resolution() {
+    let (rt, events) = blocked_in_place_runtime(std::time::Duration::from_millis(150));
+
+    rt.block_on(async {
+        let blocker = saturate_blocking_pool(std::time::Duration::from_millis(2000)).await;
+
+        tokio::spawn(async {
+            // Stall the worker outright well past the 150ms escalation
+            // threshold (wide margin: detection + escalation happen on a
+            // 50ms-tick monitor thread that can slip under CI load)...
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            // ...then release the core mid-poll.
+            tokio::task::block_in_place(|| {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            });
+        })
+        .await
+        .unwrap();
+
+        blocker.await.unwrap();
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(rt);
+
+    let events = events.lock().unwrap();
+    let escalation = events.iter().find(|e| !e.resolved);
+    let resolution = events.iter().find(|e| e.resolved);
+    assert!(
+        escalation.is_some() && resolution.is_some(),
+        "expected an escalation and a resolution event, got {events:?}"
+    );
+    assert!(
+        !escalation.unwrap().blocked_in_place,
+        "escalation fired before block_in_place; flag should be false"
+    );
+    assert!(
+        resolution.unwrap().blocked_in_place,
+        "resolution after block_in_place should carry the flag"
+    );
+}

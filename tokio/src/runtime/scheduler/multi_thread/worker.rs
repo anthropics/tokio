@@ -484,6 +484,18 @@ where
         // thread.
         take_core = true;
 
+        // Stall detection: tag the in-flight poll's (odd) generation as having
+        // released its core. The worker's generation counter stays odd until
+        // another thread claims the core, so the monitor may still report a
+        // stall for it -- the tag lets it label that stall `blocked_in_place`
+        // (worker released) rather than a poll holding the worker hostage.
+        // Nested calls never reach here (the outer call already took the core),
+        // so the store is naturally idempotent.
+        #[cfg(feature = "stall-detection")]
+        cx.worker.handle.shared.worker_metrics[cx.worker.index]
+            .blocked_in_place_generation
+            .store(core.local_generation, std::sync::atomic::Ordering::Release);
+
         // The parker should be set here
         assert!(core.park.is_some());
 
