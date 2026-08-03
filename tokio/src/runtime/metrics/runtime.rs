@@ -125,6 +125,32 @@ impl RuntimeMetrics {
                 .load(std::sync::atomic::Ordering::Acquire)
         }
 
+        /// Returns the poll generation at which the given worker last handed its
+        /// core off via `block_in_place`, or 0 if it never has.
+        ///
+        /// If this equals a stalled (odd) value observed via
+        /// [`worker_poll_generation`], the stalled poll released its core rather
+        /// than holding the worker hostage.
+        ///
+        /// [`worker_poll_generation`]: RuntimeMetrics::worker_poll_generation
+        ///
+        /// # Arguments
+        ///
+        /// `worker` is the index of the worker being queried. The given value must
+        /// be between 0 and `num_workers()`.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()`.
+        pub fn worker_blocked_in_place_generation(&self, worker: usize) -> u64 {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .blocked_in_place_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
         /// Returns the OS thread ID of the thread currently running the given worker.
         ///
         /// On Linux, this is the value from `gettid()`. Returns 0 if not available
