@@ -270,7 +270,7 @@ const MAX_LIFO_POLLS_PER_TICK: usize = 3;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create(
     size: usize,
-    park: Parker,
+    parkers: Vec<Parker>,
     driver_handle: driver::Handle,
     blocking_spawner: blocking::Spawner,
     seed_generator: RngSeedGenerator,
@@ -282,11 +282,16 @@ pub(super) fn create(
     let mut remotes = Vec::with_capacity(size);
     let mut worker_metrics = Vec::with_capacity(size);
 
+    // Workers are split into `parkers.len()` contiguous groups; group `g`
+    // shares the driver (I/O shard) behind `parkers[g]`.
+    let num_groups = parkers.len().max(1);
+    debug_assert!(num_groups <= size.max(1));
+
     // Create the local queues
-    for _ in 0..size {
+    for index in 0..size {
         let (steal, run_queue) = queue::local();
 
-        let park = park.clone();
+        let park = parkers[index * num_groups / size].clone();
         let unpark = park.unpark();
         let metrics = WorkerMetrics::from_config(&config);
         let stats = Stats::new(&metrics);
@@ -358,7 +363,44 @@ pub(super) fn create(
         }));
     }
 
+    spawn_io_debug_thread(&handle);
+
     (handle, launch)
+}
+
+cfg_io_driver! {
+    /// `TOKIO_IO_POLL_DEBUG=1`: print per-shard poll counters every 250 ms.
+    fn spawn_io_debug_thread(handle: &Arc<Handle>) {
+        #[cfg(not(loom))]
+        if crate::runtime::io::poll_debug_enabled() {
+            let h = Arc::downgrade(handle);
+            let _ = std::thread::Builder::new()
+                .name("tokio-io-debug".into())
+                .spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(Duration::from_millis(250));
+                        let Some(h) = h.upgrade() else { return };
+                        let Some(io) = h.driver.io.as_ref() else { return };
+                        let mut line = format!("[tokio-io-debug] t={:.2} rt={:p}", t0.elapsed().as_secs_f64(), &*h);
+                        for (i, (inw, gap, polls, blk, ev, since)) in
+                            io.debug_poll_snapshot().into_iter().enumerate()
+                        {
+                            line.push_str(&format!(
+                                " [{i}: waiters={inw} maxgap={gap:.1}ms polls={polls} blk={blk} ev={ev} since={since:.1}ms]"
+                            ));
+                        }
+                        eprintln!("{line}");
+                    }
+                });
+        }
+        #[cfg(loom)]
+        let _ = handle;
+    }
+}
+
+cfg_not_io_driver! {
+    fn spawn_io_debug_thread(_: &Arc<Handle>) {}
 }
 
 #[track_caller]
@@ -955,9 +997,23 @@ impl Context {
             }
         };
 
+        // Zero-timeout sweep of the other I/O shards. If it produced work
+        // for us (the queue was empty when we decided to park), don't block;
+        // `transition_from_parked` picks the tasks up. The maintenance-tick
+        // poll (`duration == Some(0)`) of our own shard always runs.
+        let helped = park.help(&self.worker.handle.driver)
+            && duration.is_none()
+            && self
+                .core
+                .borrow()
+                .as_ref()
+                .is_some_and(|core| core.has_tasks());
+
         // Park thread
         let had_driver = if let Some(timeout) = duration {
             park.park_timeout(&self.worker.handle.driver, timeout)
+        } else if helped {
+            park::HadDriver::No
         } else {
             park.park(&self.worker.handle.driver)
         };

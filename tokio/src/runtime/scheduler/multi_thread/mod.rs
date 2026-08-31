@@ -57,7 +57,7 @@ impl MultiThread {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         size: usize,
-        driver: Driver,
+        drivers: Vec<Driver>,
         driver_handle: driver::Handle,
         blocking_spawner: blocking::Spawner,
         seed_generator: RngSeedGenerator,
@@ -65,10 +65,10 @@ impl MultiThread {
         timer_flavor: TimerFlavor,
         name: Option<String>,
     ) -> (MultiThread, Arc<Handle>, Launch) {
-        let parker = Parker::new(driver);
+        let parkers = Parker::for_shards(drivers);
         let (handle, launch) = worker::create(
             size,
-            parker,
+            parkers,
             driver_handle,
             blocking_spawner,
             seed_generator,

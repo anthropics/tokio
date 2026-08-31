@@ -75,7 +75,18 @@ impl Registration {
         interest: Interest,
         handle: scheduler::Handle,
     ) -> io::Result<Registration> {
-        let shared = handle.driver().io().add_source(io, interest)?;
+        Self::new_with_interest_handle_and_fd(io, interest, handle, None)
+    }
+
+    /// `fd` is used only to choose the I/O driver shard (`SO_INCOMING_CPU`).
+    #[track_caller]
+    pub(crate) fn new_with_interest_handle_and_fd(
+        io: &mut impl Source,
+        interest: Interest,
+        handle: scheduler::Handle,
+        fd: Option<std::os::raw::c_int>,
+    ) -> io::Result<Registration> {
+        let shared = handle.driver().io().add_source(io, interest, fd)?;
 
         Ok(Registration { handle, shared })
     }

@@ -42,6 +42,30 @@ feature:
 
 See the rustdoc on those functions for the full contracts.
 
+### Sharded I/O driver (`io_shards`)
+
+`Builder::io_shards(n)` (or `TOKIO_IO_SHARDS=n`) gives a multi-thread runtime
+`n` epoll/kqueue instances instead of one. Workers are split into `n`
+contiguous groups, each parking on its own shard; sockets are placed by
+`SO_INCOMING_CPU` mapped to the CPU's L3 domain (Linux; round-robin otherwise
+or with `TOKIO_IO_SHARD_KEY=rr`). Before a worker parks, and at its
+maintenance tick, it does a zero-timeout poll of the other shards
+("help sweep"; `TOKIO_IO_SHARD_HELP=0` disables it) so readiness on a shard
+whose group is busy is not stranded. Shards share one timer wheel; signals and
+io_uring completions are serviced by shard 0. Default `1` is the stock
+single-driver behaviour. Caveats: with the help sweep disabled a shard is
+polled only by its own group, so a group whose workers never yield can delay
+that shard's I/O; `io_shards > 1` is not meant to be combined with a paused
+(`test-util`) clock.
+
+Why: with one driver only one thread per runtime can be in `epoll_wait`, and on
+runtimes with many workers readiness for every socket funnels through it. On a
+180-worker TCP request/response benchmark `io_shards(8)` measured +26% req/s
+at 64 connections (p50 −25%, +13% CPU per request), +39% at 2048 connections
+(p50 −28%, +37% CPU per request), +11% with 64 KiB messages; no effect below
+~32 workers. `TOKIO_IO_POLL_DEBUG=1` prints per-shard poll/event counters every
+250 ms.
+
 ## Publishing
 
 Publishing happens automatically when changes are pushed to the `anthropic-1.52.3` branch. The GitHub Actions workflow uses OIDC authentication with Artifactory.

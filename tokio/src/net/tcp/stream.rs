@@ -161,6 +161,17 @@ impl TcpStream {
     }
 
     pub(crate) fn new(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
+        #[cfg(unix)]
+        let io = {
+            use std::os::unix::io::AsRawFd;
+            let fd = connected.as_raw_fd();
+            PollEvented::new_with_interest_and_fd(
+                connected,
+                crate::io::Interest::READABLE | crate::io::Interest::WRITABLE,
+                Some(fd),
+            )?
+        };
+        #[cfg(not(unix))]
         let io = PollEvented::new(connected)?;
         Ok(TcpStream { io })
     }

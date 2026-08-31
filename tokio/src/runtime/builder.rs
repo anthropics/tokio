@@ -63,6 +63,10 @@ pub struct Builder {
     enable_io: bool,
     nevents: usize,
 
+    /// Number of I/O driver shards for the multi-thread runtime (`None` =
+    /// `TOKIO_IO_SHARDS` env or 1).
+    pub(super) io_shards: Option<usize>,
+
     /// Whether or not to enable the time driver
     enable_time: bool,
 
@@ -291,6 +295,8 @@ impl Builder {
             // I/O defaults to "off"
             enable_io: false,
             nevents: 1024,
+
+            io_shards: None,
 
             // Time defaults to "off"
             enable_time: false,
@@ -1267,7 +1273,62 @@ impl Builder {
             start_paused: self.start_paused,
             nevents: self.nevents,
             timer_flavor: self.timer_flavor,
+            io_shards: 1,
         }
+    }
+
+    /// Sets the number of I/O driver shards (independent `mio::Poll`
+    /// instances) used by the multi-thread runtime.
+    ///
+    /// Workers are split into `n` contiguous groups; each group parks on its
+    /// own shard, and a worker about to park also zero-timeout polls the
+    /// other shards. New sockets are placed by `SO_INCOMING_CPU` mapped to
+    /// the CPU's last-level-cache domain on Linux, round-robin elsewhere.
+    /// Timers, signals and io_uring completions are unaffected (one wheel;
+    /// shard 0 services signals). `n` is clamped to `1..=worker_threads`;
+    /// `1` is the single-driver behaviour and the default. Ignored by the
+    /// current-thread runtime; not intended for use with a paused clock.
+    ///
+    /// Environment (read once per process): `TOKIO_IO_SHARDS` sets the
+    /// default when this method is not called; `TOKIO_IO_SHARD_HELP=0`
+    /// disables the cross-shard poll; `TOKIO_IO_SHARD_KEY=rr` forces
+    /// round-robin placement; `TOKIO_IO_POLL_DEBUG=1` prints per-shard poll
+    /// counters to stderr every 250 ms.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_family = "wasm"))]
+    /// # {
+    /// let rt = tokio::runtime::Builder::new_multi_thread()
+    ///     .worker_threads(16)
+    ///     .io_shards(4)
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// # drop(rt);
+    /// # }
+    /// ```
+    pub fn io_shards(&mut self, n: usize) -> &mut Self {
+        self.io_shards = Some(n);
+        self
+    }
+
+    #[cfg(feature = "rt-multi-thread")]
+    fn resolved_io_shards(&self, workers: usize) -> usize {
+        static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let n = self.io_shards.unwrap_or_else(|| {
+            *ENV.get_or_init(|| {
+                std::env::var("TOKIO_IO_SHARDS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(1)
+            })
+        });
+        if !self.enable_io {
+            return 1;
+        }
+        n.clamp(1, workers.max(1))
     }
 
     /// Sets a custom timeout for a thread in the blocking pool.
@@ -2021,7 +2082,9 @@ cfg_rt_multi_thread! {
 
             let worker_threads = self.worker_threads.unwrap_or_else(num_cpus);
 
-            let (driver, driver_handle) = driver::Driver::new(self.get_cfg())?;
+            let mut cfg = self.get_cfg();
+            cfg.io_shards = self.resolved_io_shards(worker_threads);
+            let (drivers, driver_handle) = driver::Driver::new_sharded(cfg)?;
 
             // Create the blocking pool
             let blocking_pool =
@@ -2034,7 +2097,7 @@ cfg_rt_multi_thread! {
 
             let (scheduler, handle, launch) = MultiThread::new(
                 worker_threads,
-                driver,
+                drivers,
                 driver_handle,
                 blocking_spawner,
                 seed_generator_2,

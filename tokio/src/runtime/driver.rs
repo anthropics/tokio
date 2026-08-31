@@ -41,19 +41,42 @@ pub(crate) struct Cfg {
     pub(crate) start_paused: bool,
     pub(crate) nevents: usize,
     pub(crate) timer_flavor: crate::runtime::TimerFlavor,
+    /// Number of I/O driver shards (epoll instances). 1 = classic behaviour.
+    pub(crate) io_shards: usize,
 }
 
 impl Driver {
     pub(crate) fn new(cfg: Cfg) -> io::Result<(Self, Handle)> {
-        let (io_stack, io_handle, signal_handle) = create_io_stack(cfg.enable_io, cfg.nevents)?;
+        let (mut drivers, handle) = Self::new_sharded(Cfg {
+            io_shards: 1,
+            ..cfg
+        })?;
+        Ok((drivers.pop().unwrap(), handle))
+    }
+
+    /// Creates `cfg.io_shards` drivers sharing one handle. `drivers[i]` polls
+    /// I/O shard `i`; shard 0 additionally carries the signal/process drivers.
+    /// All of them share the single timer wheel.
+    pub(crate) fn new_sharded(cfg: Cfg) -> io::Result<(Vec<Self>, Handle)> {
+        let (io_stacks, io_handle, signal_handle) =
+            create_io_stacks(cfg.enable_io, cfg.nevents, cfg.io_shards)?;
 
         let clock = create_clock(cfg.enable_pause_time, cfg.start_paused);
 
+        let mut stacks = io_stacks.into_iter();
+        let first = stacks.next().expect("at least one io stack");
         let (time_driver, time_handle) =
-            create_time_driver(cfg.enable_time, cfg.timer_flavor, io_stack, &clock);
+            create_time_driver(cfg.enable_time, cfg.timer_flavor, first, &clock);
+
+        let mut drivers = vec![Self { inner: time_driver }];
+        for io_stack in stacks {
+            drivers.push(Self {
+                inner: create_secondary_time_driver(cfg.enable_time, cfg.timer_flavor, io_stack),
+            });
+        }
 
         Ok((
-            Self { inner: time_driver },
+            drivers,
             Handle {
                 io: io_handle,
                 signal: signal_handle,
@@ -84,6 +107,28 @@ impl Handle {
         }
 
         self.io.unpark();
+    }
+
+    /// Unparks whoever is parked on I/O shard `shard` only.
+    pub(crate) fn unpark_shard(&self, shard: usize) {
+        #[cfg(feature = "time")]
+        if let Some(handle) = &self.time {
+            handle.unpark();
+        }
+
+        self.unpark_io_shard(shard);
+    }
+
+    cfg_io_driver! {
+        fn unpark_io_shard(&self, shard: usize) {
+            self.io.unpark_shard(shard);
+        }
+    }
+
+    cfg_not_io_driver! {
+        fn unpark_io_shard(&self, _shard: usize) {
+            self.io.unpark();
+        }
     }
 
     cfg_io_driver! {
@@ -137,6 +182,8 @@ cfg_io_driver! {
     #[derive(Debug)]
     pub(crate) enum IoStack {
         Enabled(ProcessDriver),
+        /// A secondary I/O shard: epoll only, no signal/process handling.
+        Shard(IoDriver),
         Disabled(ParkThread),
     }
 
@@ -146,21 +193,26 @@ cfg_io_driver! {
         Disabled(UnparkThread),
     }
 
-    fn create_io_stack(enabled: bool, nevents: usize) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
+    fn create_io_stacks(enabled: bool, nevents: usize, shards: usize) -> io::Result<(Vec<IoStack>, IoHandle, SignalHandle)> {
         #[cfg(loom)]
         assert!(!enabled);
 
         let ret = if enabled {
-            let (io_driver, io_handle) = crate::runtime::io::Driver::new(nevents)?;
+            let (io_drivers, io_handle) = crate::runtime::io::Driver::new_sharded(nevents, shards)?;
+            let mut io_drivers = io_drivers.into_iter();
+            let first = io_drivers.next().expect("at least one shard");
 
-            let (signal_driver, signal_handle) = create_signal_driver(io_driver, &io_handle)?;
+            let (signal_driver, signal_handle) = create_signal_driver(first, &io_handle)?;
             let process_driver = create_process_driver(signal_driver);
 
-            (IoStack::Enabled(process_driver), IoHandle::Enabled(io_handle), signal_handle)
+            let mut stacks = vec![IoStack::Enabled(process_driver)];
+            stacks.extend(io_drivers.map(IoStack::Shard));
+
+            (stacks, IoHandle::Enabled(io_handle), signal_handle)
         } else {
             let park_thread = ParkThread::new();
             let unpark_thread = park_thread.unpark();
-            (IoStack::Disabled(park_thread), IoHandle::Disabled(unpark_thread), Default::default())
+            (vec![IoStack::Disabled(park_thread)], IoHandle::Disabled(unpark_thread), Default::default())
         };
 
         Ok(ret)
@@ -170,6 +222,7 @@ cfg_io_driver! {
         pub(crate) fn park(&mut self, handle: &Handle) {
             match self {
                 IoStack::Enabled(v) => v.park(handle),
+                IoStack::Shard(v) => v.park(handle),
                 IoStack::Disabled(v) => v.park(),
             }
         }
@@ -177,6 +230,7 @@ cfg_io_driver! {
         pub(crate) fn park_timeout(&mut self, handle: &Handle, duration: Duration) {
             match self {
                 IoStack::Enabled(v) => v.park_timeout(handle, duration),
+                IoStack::Shard(v) => v.park_timeout(handle, duration),
                 IoStack::Disabled(v) => v.park_timeout(duration),
             }
         }
@@ -184,6 +238,7 @@ cfg_io_driver! {
         pub(crate) fn shutdown(&mut self, handle: &Handle) {
             match self {
                 IoStack::Enabled(v) => v.shutdown(handle),
+                IoStack::Shard(v) => v.shutdown(handle),
                 IoStack::Disabled(v) => v.shutdown(),
             }
         }
@@ -193,6 +248,13 @@ cfg_io_driver! {
         pub(crate) fn unpark(&self) {
             match self {
                 IoHandle::Enabled(handle) => handle.unpark(),
+                IoHandle::Disabled(handle) => handle.unpark(),
+            }
+        }
+
+        pub(crate) fn unpark_shard(&self, shard: usize) {
+            match self {
+                IoHandle::Enabled(handle) => handle.unpark_shard(shard),
                 IoHandle::Disabled(handle) => handle.unpark(),
             }
         }
@@ -212,13 +274,14 @@ cfg_not_io_driver! {
     #[derive(Debug)]
     pub(crate) struct IoStack(ParkThread);
 
-    fn create_io_stack(_enabled: bool, _nevents: usize) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
+    fn create_io_stacks(_enabled: bool, _nevents: usize, _shards: usize) -> io::Result<(Vec<IoStack>, IoHandle, SignalHandle)> {
         let park_thread = ParkThread::new();
         let unpark_thread = park_thread.unpark();
-        Ok((IoStack(park_thread), unpark_thread, Default::default()))
+        Ok((vec![IoStack(park_thread)], unpark_thread, Default::default()))
     }
 
     impl IoStack {
+
         pub(crate) fn park(&mut self, _handle: &Handle) {
             self.0.park();
         }
@@ -324,6 +387,26 @@ cfg_time! {
         }
     }
 
+    /// Time driver wrapper for a secondary I/O shard: shares the wheel created
+    /// by `create_time_driver` (via the runtime `Handle`), owns only its park.
+    fn create_secondary_time_driver(
+        enable: bool,
+        timer_flavor: crate::runtime::TimerFlavor,
+        io_stack: IoStack,
+    ) -> TimeDriver {
+        if enable {
+            match timer_flavor {
+                crate::runtime::TimerFlavor::Traditional => TimeDriver::Enabled {
+                    driver: crate::runtime::time::Driver::from_park(io_stack),
+                },
+                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                crate::runtime::TimerFlavor::Alternative => TimeDriver::EnabledAlt(io_stack),
+            }
+        } else {
+            TimeDriver::Disabled(io_stack)
+        }
+    }
+
     impl TimeDriver {
         pub(crate) fn park(&mut self, handle: &Handle) {
             match self {
@@ -368,6 +451,14 @@ cfg_not_time! {
         _clock: &Clock,
     ) -> (TimeDriver, TimeHandle) {
         (io_stack, ())
+    }
+
+    fn create_secondary_time_driver(
+        _enable: bool,
+        _timer_flavor: crate::runtime::TimerFlavor,
+        io_stack: IoStack,
+    ) -> TimeDriver {
+        io_stack
     }
 }
 

@@ -111,13 +111,35 @@ impl<E: Source> PollEvented<E> {
         Self::new_with_interest_and_handle(io, interest, scheduler::Handle::current())
     }
 
+    /// Like `new_with_interest`; `fd` is only used to pick the I/O driver shard.
+    #[track_caller]
+    #[cfg_attr(not(all(unix, feature = "net")), allow(dead_code))]
+    pub(crate) fn new_with_interest_and_fd(
+        io: E,
+        interest: Interest,
+        fd: Option<std::os::raw::c_int>,
+    ) -> io::Result<Self> {
+        Self::with_handle_and_fd(io, interest, scheduler::Handle::current(), fd)
+    }
+
     #[track_caller]
     pub(crate) fn new_with_interest_and_handle(
-        mut io: E,
+        io: E,
         interest: Interest,
         handle: scheduler::Handle,
     ) -> io::Result<Self> {
-        let registration = Registration::new_with_interest_and_handle(&mut io, interest, handle)?;
+        Self::with_handle_and_fd(io, interest, handle, None)
+    }
+
+    #[track_caller]
+    fn with_handle_and_fd(
+        mut io: E,
+        interest: Interest,
+        handle: scheduler::Handle,
+        fd: Option<std::os::raw::c_int>,
+    ) -> io::Result<Self> {
+        let registration =
+            Registration::new_with_interest_handle_and_fd(&mut io, interest, handle, fd)?;
         Ok(Self {
             io: Some(io),
             registration,

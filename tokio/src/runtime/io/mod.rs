@@ -3,6 +3,8 @@
     allow(dead_code)
 )]
 mod driver;
+#[cfg(all(feature = "rt-multi-thread", not(loom)))]
+pub(crate) use driver::poll_debug_enabled;
 use driver::{Direction, Tick};
 pub(crate) use driver::{Driver, Handle, ReadyEvent};
 
