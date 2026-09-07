@@ -111,5 +111,10 @@ name = "rt_quiesce"
 path = "rt_quiesce.rs"
 harness = false
 
+[[bench]]
+name = "net_accept"
+path = "net_accept.rs"
+harness = false
+
 [lints]
 workspace = true
