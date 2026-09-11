@@ -42,6 +42,28 @@ feature:
 
 See the rustdoc on those functions for the full contracts.
 
+### Sharded I/O driver (`io_shards`)
+
+`Builder::io_shards(n)` gives a multi-thread runtime `n` epoll/kqueue
+instances instead of one, each polled by its own group of workers. With one
+instance, only one thread per runtime can be in `epoll_wait`, and every
+`epoll_ctl` waits while a reader of `/proc/<pid>/fdinfo/<epfd>` (a host agent,
+for example) walks the whole set under the epoll mutex. Shards divide both
+costs by `n`. On a 180-worker TCP request/response benchmark, `io_shards(8)`
+gave +20% req/s at 64 connections (+7% CPU per request); it had no effect
+below about 32 workers. It does not change overload behaviour; that is
+`max_io_events_per_busy_tick`.
+
+`1` is the default. `TOKIO_IO_SHARDS=n` sets a process-wide default; because
+it reaches every runtime in the process, it is lowered until each shard has at
+least 8 workers. An explicit `io_shards(n)` is only clamped to the worker
+count. Costs while idle: one wakeup per shard per
+`Builder::io_shard_sweep_interval` (default 10 ms), and every timer deadline
+wakes all `n` drivers. Not meant for use with a paused (`test-util`) clock.
+
+See the rustdoc on `Builder::io_shards`, `io_shard_sweep_interval` and
+`max_io_events_per_busy_tick` for the full contracts.
+
 ## Publishing
 
 Publishing happens automatically when changes are pushed to the `anthropic-1.52.3` branch. The GitHub Actions workflow uses OIDC authentication with Artifactory.

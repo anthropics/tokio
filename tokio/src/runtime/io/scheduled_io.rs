@@ -105,6 +105,9 @@ pub(crate) struct ScheduledIo {
     readiness: AtomicUsize,
 
     waiters: Mutex<Waiters>,
+
+    /// I/O driver shard this resource is registered on.
+    shard: usize,
 }
 
 type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
@@ -175,13 +178,18 @@ const SHUTDOWN: bit::Pack = TICK.then(1);
 
 // ===== impl ScheduledIo =====
 
-impl Default for ScheduledIo {
-    fn default() -> ScheduledIo {
+impl ScheduledIo {
+    pub(crate) fn new(shard: usize) -> ScheduledIo {
         ScheduledIo {
             linked_list_pointers: UnsafeCell::new(linked_list::Pointers::new()),
             readiness: AtomicUsize::new(0),
             waiters: Mutex::new(Waiters::default()),
+            shard,
         }
+    }
+
+    pub(crate) fn shard(&self) -> usize {
+        self.shard
     }
 }
 
