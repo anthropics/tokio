@@ -98,6 +98,47 @@ fn closing_unbounded_rx() {
 }
 
 #[test]
+fn dropping_unbounded_rx_during_send() {
+    loom::model(|| {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let value = Arc::new(());
+
+        // Leave one free slot in the first block, so that one of the sends
+        // below has to allocate the next block.
+        for _ in 1..BLOCK_CAP {
+            assert_ok!(tx.send(value.clone()));
+        }
+
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let tx = tx.clone();
+                let value = value.clone();
+                thread::spawn(move || {
+                    // If the channel is already closed, the value is handed
+                    // back and dropped here.
+                    let _ = tx.send(value);
+                })
+            })
+            .collect();
+
+        drop(rx);
+
+        for th in threads {
+            assert_ok!(th.join());
+        }
+
+        // `tx` keeps the channel allocated, so only the receiver can have
+        // dropped the values that were accepted.
+        assert_eq!(
+            1,
+            Arc::strong_count(&value),
+            "a value accepted by `send` outlived the receiver"
+        );
+        drop(tx);
+    });
+}
+
+#[test]
 fn dropping_tx() {
     loom::model(|| {
         let (tx, mut rx) = mpsc::channel::<()>(16);

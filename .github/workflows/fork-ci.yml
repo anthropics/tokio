@@ -79,4 +79,5 @@ jobs:
         working-directory: tokio
         run: |
           cargo test --lib --release --features full,test-util -- --test-threads=1 \
-            loom_current_thread loom_blocking runtime::time::tests
+            loom_current_thread loom_blocking runtime::time::tests \
+            loom_mpsc::dropping_unbounded_rx_during_send

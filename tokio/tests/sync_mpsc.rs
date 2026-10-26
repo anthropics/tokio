@@ -924,6 +924,54 @@ fn unconsumed_messages_are_dropped() {
 }
 
 #[test]
+#[cfg(not(target_family = "wasm"))] // Wasm doesn't support threads
+fn dropping_unbounded_rx_during_send() {
+    use std::sync::Barrier;
+
+    // Without loom the race is only hit now and then, and hardly ever on a
+    // single CPU, so try many times. The loom test of the same name always
+    // hits it.
+    const ROUNDS: usize = if cfg!(miri) { 100 } else { 10_000 };
+
+    let barrier = Barrier::new(2);
+
+    for _ in 0..ROUNDS {
+        let msg = Arc::new(());
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                barrier.wait();
+                // If the channel is already closed, the message is handed back
+                // and dropped here.
+                let _ = tx.send(msg.clone());
+            });
+
+            barrier.wait();
+            drop(rx);
+        });
+
+        // `tx` keeps the channel allocated, so only the receiver can have
+        // dropped a message that was accepted.
+        assert_eq!(
+            1,
+            Arc::strong_count(&msg),
+            "a message accepted by `send` outlived the receiver"
+        );
+    }
+}
+
+#[test]
+fn dropping_rx_does_not_wait_for_permit() {
+    let (tx, rx) = mpsc::channel::<()>(1);
+    let permit = tx.try_reserve().unwrap();
+
+    // A permit may be held forever, so this must return while it is held.
+    drop(rx);
+    drop(permit);
+}
+
+#[test]
 #[cfg(all(feature = "full", not(target_os = "wasi")))] // Wasi doesn't support threads
 fn blocking_recv() {
     let (tx, mut rx) = mpsc::channel::<u8>(1);

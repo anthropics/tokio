@@ -59,8 +59,8 @@ jobs:
         # sha256 pinned here. To move to a newer release, change the two
         # together.
         env:
-          GRANARY_UPLOAD_VERSION: "0.2.0"
-          GRANARY_UPLOAD_SHA256: "d940c308ea5ce021a7696a9b2761b4bb9b87e2796f6084bba36042e918cf614a"
+          GRANARY_UPLOAD_VERSION: "0.4.1"
+          GRANARY_UPLOAD_SHA256: "461d9111ca32bbac8d1f21d9136c8b2bd38e3db3f567877b36a589c19d8f9353"
         run: |
           set -euo pipefail
           jwt=$(curl -fsS --proto '=https' --retry 3 --retry-max-time 60 --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \

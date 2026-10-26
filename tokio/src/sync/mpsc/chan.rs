@@ -38,6 +38,11 @@ impl<T, S: Semaphore + fmt::Debug> fmt::Debug for Rx<T, S> {
 }
 
 pub(crate) trait Semaphore {
+    /// Whether a permit can be held without sending, as a `Permit` can. If
+    /// `false`, every permit in use is a queued value or a `send` about to push
+    /// one, so `Rx::drop` can wait for them.
+    const CAN_RESERVE: bool;
+
     fn is_idle(&self) -> bool;
 
     fn add_permit(&self);
@@ -488,6 +493,13 @@ impl<T, S: Semaphore> Drop for Rx<T, S> {
     fn drop(&mut self) {
         use super::block::Read::Value;
 
+        // Outside loom, `crate::loom::thread::yield_now` is only a spin hint; a
+        // descheduled sender needs the CPU.
+        #[cfg(loom)]
+        use crate::loom::thread::yield_now;
+        #[cfg(not(loom))]
+        use std::thread::yield_now;
+
         self.close();
 
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
@@ -500,9 +512,22 @@ impl<T, S: Semaphore> Drop for Rx<T, S> {
 
             impl<'a, T, S: Semaphore> Guard<'a, T, S> {
                 fn drain(&mut self) {
-                    // call T's destructor.
-                    while let Some(Value(_)) = self.list.pop(self.tx) {
-                        self.sem.add_permit();
+                    loop {
+                        // call T's destructor.
+                        while let Some(Value(_)) = self.list.pop(self.tx) {
+                            self.sem.add_permit();
+                        }
+
+                        // Not in upstream Tokio.
+                        // A `send` counted before the close may not have pushed
+                        // yet; wait for it, or its value lives until the channel
+                        // is freed. Closing and counting use one atomic, so no
+                        // such `send` is missed and later ones fail.
+                        if S::CAN_RESERVE || self.sem.is_idle() {
+                            return;
+                        }
+
+                        yield_now();
                     }
                 }
             }
@@ -570,6 +595,8 @@ impl<T, S> Drop for Chan<T, S> {
 // ===== impl Semaphore for (::Semaphore, capacity) =====
 
 impl Semaphore for bounded::Semaphore {
+    const CAN_RESERVE: bool = true;
+
     fn add_permit(&self) {
         self.semaphore.release(1);
     }
@@ -594,6 +621,8 @@ impl Semaphore for bounded::Semaphore {
 // ===== impl Semaphore for AtomicUsize =====
 
 impl Semaphore for unbounded::Semaphore {
+    const CAN_RESERVE: bool = false;
+
     fn add_permit(&self) {
         let prev = self.0.fetch_sub(2, Release);
 
